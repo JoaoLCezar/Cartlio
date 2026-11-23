@@ -1,10 +1,10 @@
-# Cartlio — Etapa A: direção de produto e arquitetura
+# Quadrics — Etapa A: direção de produto e arquitetura
 
 **Estado:** proposta para validação, 21/10/2026. Este documento fixa a direção inicial; não representa código implementado nem aprovação de regras comerciais ou jurídicas.
 
 ## 1. Visão executiva
 
-Cartlio é um SaaS para fotógrafos entregarem galerias privadas, recolherem seleções de clientes e disponibilizarem arquivos digitais. O primeiro lançamento deve provar que fotógrafos conseguem completar o ciclo **criar workspace → criar galeria → enviar imagens → compartilhar → receber seleção → entregar downloads** com segurança e custo previsível. A receita inicial pode vir de assinaturas; vendas avulsas exigem validação comercial e operacional separada.
+Quadrics é um SaaS para fotógrafos entregarem galerias privadas, recolherem seleções de clientes e disponibilizarem arquivos digitais. O primeiro lançamento deve provar que fotógrafos conseguem completar o ciclo **criar workspace → criar galeria → enviar imagens → compartilhar → receber seleção → entregar downloads** com segurança e custo previsível. A receita inicial pode vir de assinaturas; vendas avulsas exigem validação comercial e operacional separada.
 
 **Personas e resultado esperado**
 

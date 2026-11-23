@@ -2,4 +2,33 @@ project_id = "cartlio"
 
 [auth]
 site_url = "http://localhost:3000"
-additional_redirect_urls = ["http://localhost:3000/auth/callback"]
+additional_redirect_urls = ["http://localhost:3000/auth/callback", "http://127.0.0.1:3310/auth/callback"]
+
+[local_smtp]
+enabled = true
+port = 54324
+smtp_port = 54325
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[storage.buckets.gallery-originals]
+public = false
+file_size_limit = "50MiB"
+allowed_mime_types = ["image/jpeg", "image/png"]
+
+[storage.buckets.gallery-previews]
+public = false
+file_size_limit = "6MiB"
+allowed_mime_types = ["image/webp"]
+
+[storage.buckets.gallery-thumbnails]
+public = false
+file_size_limit = "2MiB"
+allowed_mime_types = ["image/webp"]
+
+[storage.buckets.gallery-brand-assets]
+public = false
+file_size_limit = "2MiB"
+allowed_mime_types = ["image/webp"]

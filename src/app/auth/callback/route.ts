@@ -1,13 +1,18 @@
-import { NextResponse, type NextRequest } from "next/server";
+import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { supabaseConfig } from "@/lib/supabase/config";
+import { safeInvitationReturnPath } from "@/lib/auth-redirect";
 
-export async function GET(request: NextRequest) {
-  const code = request.nextUrl.searchParams.get("code");
+export async function GET(request: Request) {
+  const requestUrl = new URL(request.url);
+  const code = requestUrl.searchParams.get("code");
   if (code && supabaseConfig()) {
     const supabase = await createClient();
     const { error } = await supabase.auth.exchangeCodeForSession(code);
-    if (!error) return NextResponse.redirect(new URL("/painel", request.url));
+    if (!error) {
+      const next = requestUrl.searchParams.get("next");
+      redirect(next === "/redefinir-senha" ? next : safeInvitationReturnPath(next) ?? "/painel");
+    }
   }
-  return NextResponse.redirect(new URL("/login", request.url));
+  redirect("/login");
 }

@@ -6,9 +6,14 @@ const length = (value: string) => [...value].length;
 export function parseCustomer(data: FormData) {
   const name = text(data, "name");
   const email = text(data, "email").toLowerCase();
+  const rawWhatsAppPhone = text(data, "whatsapp_phone");
+  const whatsappPhone = rawWhatsAppPhone.replace(/[\s().-]/g, "");
   if (!name || length(name) > 120) return { error: "Informe um nome de até 120 caracteres." } as const;
   if (email && (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) return { error: "Informe um e-mail válido ou deixe o campo vazio." } as const;
-  return { value: { name, email: email || null } } as const;
+  if (rawWhatsAppPhone && (rawWhatsAppPhone.length > 32 || !/^\+[1-9][0-9]{7,14}$/.test(whatsappPhone))) {
+    return { error: "Informe o WhatsApp com código do país, por exemplo +55 11 99999-9999, ou deixe o campo vazio." } as const;
+  }
+  return { value: { name, email: email || null, whatsapp_phone: whatsappPhone || null } } as const;
 }
 export function parseGallery(data: FormData) {
   const title = text(data, "title");

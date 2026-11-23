@@ -1,6 +1,11 @@
 services:
   web:
-    build: .
+    build:
+      context: .
+      target: development
+    env_file:
+      - path: .env.local
+        required: false
     ports:
       - "127.0.0.1:3000:3000"
     volumes:
@@ -9,8 +14,7 @@ services:
       - next_cache:/app/.next
     environment:
       NEXT_TELEMETRY_DISABLED: "1"
-      NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-http://host.docker.internal:54321}
-      NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-}
+      NEXT_PUBLIC_SUPABASE_URL: ${QUADRICS_DOCKER_SUPABASE_URL:-${CARTLIO_DOCKER_SUPABASE_URL:-http://host.docker.internal:54321}}
 
 volumes:
   node_modules:

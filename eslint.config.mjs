@@ -5,5 +5,5 @@ import nextTs from "eslint-config-next/typescript";
 export default defineConfig([
   ...nextVitals,
   ...nextTs,
-  globalIgnores([".next/**", "out/**", "build/**", ".tools/**", "next-env.d.ts"]),
+  globalIgnores([".next/**", ".next-*/**", "out/**", "build/**", "build-cartlio-restore-*/**", ".tools/**", "test-results/**", "playwright-report/**", "next-env.d.ts"]),
 ]);

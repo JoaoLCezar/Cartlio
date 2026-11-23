@@ -1,7 +1,12 @@
 node_modules
 .next
+.next-e2e
 .git
 .env*
 coverage
+test-results
+playwright-report
 docs
 .tools
+supabase/.temp
+supabase/.branches

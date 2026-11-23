@@ -6,25 +6,114 @@ jobs:
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm audit --audit-level=high
       - run: npm run lint
       - run: npm run typecheck
-      - run: npm run build
+      - run: npm test
+      - name: Build production container
+        run: >-
+          docker build --target runner
+          --build-arg NEXT_PUBLIC_SUPABASE_URL=https://ci-placeholder.supabase.co
+          --build-arg NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=ci-placeholder-public-key
+          -t quadrics-web:ci .
+      - name: Smoke test production container
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          container="quadrics-web-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          health_body="$(mktemp)"
+          response_headers="$(mktemp)"
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            rm -f -- "$health_body" "$response_headers"
+          }
+          trap cleanup EXIT
+
+          docker run --detach --name "$container" \
+            --publish 127.0.0.1::3000 \
+            --env QUADRICS_APP_URL=https://ci-placeholder.example \
+            --env SUPABASE_SERVER_SECRET_KEY=ci-placeholder-server-secret \
+            --env QUADRICS_TRUSTED_CLIENT_IP_HEADER=x-forwarded-for \
+            --env QUADRICS_SMTP_HOST=127.0.0.1 \
+            --env QUADRICS_SMTP_PORT=587 \
+            --env QUADRICS_SMTP_FROM='Quadrics <ci@example.test>' \
+            quadrics-web:ci >/dev/null
+          port="$(docker port "$container" 3000/tcp | sed 's/.*://')"
+          base_url="http://127.0.0.1:$port"
+
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent "$base_url/api/health" -o "$health_body"; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" -eq 1
+          node -e 'const fs=require("node:fs");if(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).status!=="ok")process.exit(1)' "$health_body"
+          test "$(docker inspect --format='{{.Config.User}}' "$container")" = "nextjs"
+
+          healthy=0
+          for attempt in $(seq 1 60); do
+            state="$(docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container")"
+            if [ "$state" = "healthy" ]; then healthy=1; break; fi
+            if [ "$state" = "unhealthy" ]; then docker logs --tail 50 "$container"; exit 1; fi
+            sleep 1
+          done
+          test "$healthy" -eq 1
+
+          curl --fail --silent --show-error "$base_url/" -D "$response_headers" -o /dev/null
+          grep --ignore-case --extended-regexp --quiet '^Strict-Transport-Security:[[:space:]]*max-age=31536000' "$response_headers"
+          grep --ignore-case --extended-regexp --quiet '^X-Content-Type-Options:[[:space:]]*nosniff' "$response_headers"
+          grep --ignore-case --extended-regexp --quiet '^Content-Security-Policy:.*script-src[^;]*nonce-' "$response_headers"
+          if grep --ignore-case --extended-regexp --quiet '^Content-Security-Policy:.*unsafe-eval' "$response_headers"; then exit 1; fi
   database:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
       - run: npm ci
       - run: npm run db:start
       - run: npm run db:test
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Create a synthetic member for the restore login test
+        id: restore-member
+        env:
+          QUADRICS_CI_RESTORE_FIXTURE: "1"
+        run: node scripts/restore-fixture.mjs
+      - name: Create isolated restore fixture
+        id: restore-fixture
+        env:
+          QUADRICS_BACKUP_PASSPHRASE: cartlio-ci-fixture-passphrase-2026
+        run: |
+          backup_root="$RUNNER_TEMP/cartlio-restore-backups"
+          mkdir -p "$backup_root"
+          backup_output="$(npm run backup:local -- --output "$backup_root" --encrypt)"
+          printf '%s\n' "$backup_output"
+          backup_path="$(printf '%s\n' "$backup_output" | tail -n 1 | jq -er '.backup')"
+          [[ "$backup_path" == *.cartlio.enc ]]
+          verify_output="$(npm run backup:verify -- "$backup_path")"
+          printf '%s\n' "$verify_output"
+          printf '%s\n' "$verify_output" | tail -n 1 | jq -e '.valid == true and .complete == true and .encrypted == true' >/dev/null
+          printf 'path=%s\n' "$backup_path" >> "$GITHUB_OUTPUT"
+      - name: Restore into a disposable Supabase and test the app
+        env:
+          QUADRICS_BACKUP_PASSPHRASE: cartlio-ci-fixture-passphrase-2026
+          QUADRICS_RESTORE_FIXTURE_EMAIL: ${{ steps.restore-member.outputs.email }}
+          QUADRICS_RESTORE_FIXTURE_PASSWORD: ${{ steps.restore-member.outputs.password }}
+        run: npm run backup:restore-e2e -- --backup "${{ steps.restore-fixture.outputs.path }}"
+      - if: always()
+        name: Remove restore fixture
+        run: rm -rf -- "$RUNNER_TEMP/cartlio-restore-backups"
       - if: always()
         run: npx supabase stop --no-backup

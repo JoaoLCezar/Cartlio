@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Cartlio — Entregue suas fotografias com cuidado",
+  title: "Quadrics — Entregue suas fotografias com cuidado",
   description: "Galerias para fotógrafos e seus clientes.",
 };
 

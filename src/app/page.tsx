@@ -1,32 +1,62 @@
 import Link from "next/link";
 
+export const dynamic = "force-dynamic";
+
 export default function HomePage() {
   return (
-    <main className="min-h-screen bg-stone-950 text-stone-50">
-      <div className="mx-auto flex min-h-screen max-w-6xl flex-col px-6 py-8 sm:px-10">
-        <header className="flex items-center justify-between border-b border-white/15 pb-6">
-          <span className="text-2xl font-semibold tracking-tight">cartlio<span className="text-amber-400">.</span></span>
-          <Link href="/login" className="text-sm text-amber-300">Entrar</Link>
+    <main className="homepage">
+      <div className="homepage-inner">
+        <header className="homepage-header">
+          <Link href="/" className="brand-wordmark" aria-label="Quadrics, início">quadrics<span>.</span></Link>
+          <Link href="/login">Entrar na sua conta <span aria-hidden="true">↗</span></Link>
         </header>
-        <section className="grid flex-1 items-center gap-12 py-20 lg:grid-cols-[1.15fr_0.85fr]">
-          <div>
-            <p className="mb-6 text-sm font-medium uppercase tracking-[0.25em] text-amber-400">Para fotógrafos</p>
-            <h1 className="max-w-3xl text-5xl font-semibold leading-[1.08] tracking-tight sm:text-7xl">
-              Seu trabalho merece uma entrega à altura.
-            </h1>
-            <p className="mt-8 max-w-xl text-lg leading-8 text-stone-300">
-              Organize galerias, compartilhe imagens e receba as escolhas dos seus clientes em um só lugar.
+
+        <section className="homepage-hero">
+          <div className="homepage-copy">
+            <p className="eyebrow">Um novo jeito de entregar</p>
+            <h1 className="homepage-title">Suas histórias merecem ser <em>vividas de novo.</em></h1>
+            <p className="homepage-description">
+              Um espaço bonito e simples para organizar seus ensaios, compartilhar galerias privadas e escolher entre receber uma seleção do cliente ou entregar todas as fotos.
             </p>
-            <Link href="/cadastro" className="button mt-10">Criar minha conta</Link>
-            <p className="mt-4 text-sm text-stone-400">Acesso inicial: contas e workspaces. Galerias em desenvolvimento.</p>
+            <div className="homepage-actions">
+              <Link href="/cadastro" className="button">Criar minha conta <span aria-hidden="true">↗</span></Link>
+              <Link href="/login" className="button-secondary">Já tenho uma conta</Link>
+            </div>
+            <p className="homepage-note">Feito para fotógrafos que cuidam de cada detalhe.</p>
           </div>
-          <div aria-hidden="true" className="relative aspect-[4/5] overflow-hidden rounded-[2rem] border border-white/10 bg-gradient-to-br from-amber-100/90 via-stone-500 to-stone-900 shadow-2xl">
-            <div className="absolute inset-8 rounded-t-full border border-white/35" />
-            <div className="absolute inset-16 rounded-t-full border border-white/25" />
-            <div className="absolute bottom-10 left-10 right-10 border-t border-white/50 pt-5 text-sm tracking-[0.2em] text-white">SUAS HISTÓRIAS, BEM APRESENTADAS</div>
+
+          <div className="hero-art" aria-label="Prévia artística de uma galeria de fotografia" role="img">
+            <div className="hero-art-backdrop" />
+            <div className="hero-frame" />
+            <div className="hero-caption">
+              <span>Galeria de exemplo</span>
+              <strong>Um dia para guardar</strong>
+            </div>
           </div>
         </section>
-        <footer className="border-t border-white/15 pt-6 text-sm text-stone-500">© {new Date().getFullYear()} Cartlio</footer>
+
+        <section className="homepage-proof" aria-label="O que você pode fazer no Quadrics">
+          <article>
+            <small>01 — ORGANIZE</small>
+            <h2>Clientes e galerias, juntos</h2>
+            <p>Encontre cada trabalho com facilidade e mantenha tudo em ordem.</p>
+          </article>
+          <article>
+            <small>02 — APRESENTE</small>
+            <h2>Uma entrega à altura</h2>
+            <p>Compartilhe uma experiência clara e acolhedora com seus clientes.</p>
+          </article>
+          <article>
+            <small>03 — ENTREGUE</small>
+            <h2>Você escolhe como entregar</h2>
+            <p>Peça ao cliente que selecione as fotos ou disponibilize a galeria completa em um só link.</p>
+          </article>
+        </section>
+
+        <footer className="homepage-footer">
+          <span>© {new Date().getFullYear()} Quadrics</span>
+          <span>Fotografias bem cuidadas, do começo ao fim.</span>
+        </footer>
       </div>
     </main>
   );
