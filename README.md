@@ -1,4 +1,6 @@
-# Quadrics
+# Cartlio
+
+Projeto em adaptação para a estrutura mestre Quadrics. O nome comercial final ainda está em definição.
 
 Documentação de desenvolvimento:
 
