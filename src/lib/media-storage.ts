@@ -3,6 +3,7 @@ import { Readable } from "node:stream";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { createR2OriginalAccess, R2Original } from "../../scripts/lib/r2-originals.mjs";
 import { signPhotoPathsInBatches } from "./gallery-photo-data";
+import { mediaStorageProviders } from "./media-storage-policy";
 
 const buckets = {
   original: "gallery-originals",
@@ -11,10 +12,14 @@ const buckets = {
   studioLogo: "gallery-brand-assets",
 } as const;
 
-type MediaKind = keyof typeof buckets;
-type DisplayMediaKind = Exclude<MediaKind, "original">;
+type DisplayMediaKind = "preview" | "thumbnail" | "studioLogo";
 type StorageClient = Pick<SupabaseClient, "storage">;
 let r2Access: ReturnType<typeof createR2OriginalAccess> | undefined;
+
+function supabaseDisplayBucket(kind: DisplayMediaKind) {
+  if (mediaStorageProviders[kind] !== "supabase") throw new Error("MEDIA_STORAGE_PROVIDER_UNSUPPORTED");
+  return buckets[kind];
+}
 
 export async function openR2Original(original: R2Original, signal?: AbortSignal): Promise<ReadableStream<Uint8Array>> {
   if (!r2Access) {
@@ -36,7 +41,7 @@ export async function mediaStorageReady({ storage }: StorageClient) {
 // The caller authorizes the object first. Keep the supplied Supabase session
 // so dashboard reads still use the member's storage policies.
 export function createMediaReader({ storage }: StorageClient) {
-  async function signOriginal(path: string, expiresIn: number, filename?: string) {
+  async function signSupabaseOriginal(path: string, expiresIn: number, filename?: string) {
     const options = filename === undefined ? undefined : { download: filename };
     const { data, error } = await storage.from(buckets.original).createSignedUrl(path, expiresIn, options);
     return error ? null : data?.signedUrl ?? null;
@@ -44,18 +49,19 @@ export function createMediaReader({ storage }: StorageClient) {
 
   return {
     async readImage(kind: DisplayMediaKind, path: string) {
-      const { data, error } = await storage.from(buckets[kind]).download(path);
+      const { data, error } = await storage.from(supabaseDisplayBucket(kind)).download(path);
       return error ? null : data;
     },
 
-    signPaths(kind: MediaKind, paths: readonly string[], expiresIn: number) {
-      return signPhotoPathsInBatches(paths, batch => storage.from(buckets[kind]).createSignedUrls(batch, expiresIn));
+    signPaths(kind: DisplayMediaKind, paths: readonly string[], expiresIn: number) {
+      return signPhotoPathsInBatches(paths,
+        batch => storage.from(supabaseDisplayBucket(kind)).createSignedUrls(batch, expiresIn));
     },
 
-    signOriginal,
+    signSupabaseOriginal,
 
     async openOriginal(path: string, expiresIn: number) {
-      const url = await signOriginal(path, expiresIn);
+      const url = await signSupabaseOriginal(path, expiresIn);
       if (!url) throw new Error("Não foi possível preparar o original autorizado.");
       const response = await fetch(url, { cache: "no-store" });
       if (!response.ok || !response.body) throw new Error("O original autorizado não está disponível no armazenamento.");

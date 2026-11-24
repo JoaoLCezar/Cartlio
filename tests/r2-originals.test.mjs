@@ -103,3 +103,59 @@ test("canceling a download before consuming its stream closes the upstream body"
   await new Promise(resolve => stream.closed ? resolve() : stream.once("close", resolve));
   assert.equal(upstream.destroyed, true);
 });
+
+test("R2 deletion checks the recorded object identity, deletes, and confirms absence", async () => {
+  const requests = [];
+  const responses = [
+    { statusCode: 200, headers: { "content-length": "4", "content-type": "image/png", etag: photo.storage_etag } },
+    { statusCode: 204, headers: {} },
+    { statusCode: 404, headers: {} },
+  ];
+  const access = createR2OriginalAccess(env, {
+    requestHandler: {
+      async handle(request) {
+        requests.push(request);
+        return { response: { ...responses.shift(), body: Readable.from([]) } };
+      },
+    },
+  });
+
+  assert.deepEqual(await access.deleteVerifiedOriginal(photo), { absent: true, wasPresent: true });
+  assert.deepEqual(requests.map(request => request.method), ["HEAD", "DELETE", "HEAD"]);
+  assert.equal(requests[0].headers["if-match"], photo.storage_etag);
+  assert.equal(requests[1].path, `/${env.R2_BUCKET}/${photo.object_path}`);
+});
+
+test("R2 deletion does not delete an object whose metadata or ETag differs", async () => {
+  const requests = [];
+  const access = createR2OriginalAccess(env, {
+    requestHandler: {
+      async handle(request) {
+        requests.push(request);
+        return { response: {
+          statusCode: 200,
+          headers: { "content-length": "5", "content-type": "image/png", etag: '"different"' },
+          body: Readable.from([]),
+        } };
+      },
+    },
+  });
+
+  await assert.rejects(access.deleteVerifiedOriginal(photo), { message: "R2_ORIGINAL_CHANGED" });
+  assert.deepEqual(requests.map(request => request.method), ["HEAD"]);
+});
+
+test("R2 deletion treats a missing original as already absent", async () => {
+  const requests = [];
+  const access = createR2OriginalAccess(env, {
+    requestHandler: {
+      async handle(request) {
+        requests.push(request);
+        return { response: { statusCode: 404, headers: {}, body: Readable.from([]) } };
+      },
+    },
+  });
+
+  assert.deepEqual(await access.deleteVerifiedOriginal(photo), { absent: true, wasPresent: false });
+  assert.deepEqual(requests.map(request => request.method), ["HEAD"]);
+});

@@ -8,6 +8,7 @@ try {
   const summary = await auditStorage(maintenanceClient(options.mode), options.tenantId, {
     includePaths: options.includePaths,
     includeUsage: options.includeUsage,
+    includeR2: options.includeR2,
   });
   const report = {
     schema_version: 2,
@@ -37,7 +38,7 @@ try {
     }
   }
   process.stdout.write(`${JSON.stringify(comparison ? { ...report, comparison } : report)}\n`);
-  if (summary.findings.total) process.exitCode = 1;
+  if (summary.findings.total || !summary.audit_complete) process.exitCode = 1;
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : "Auditoria do Storage não concluída."}\n`);
   process.exitCode = 1;

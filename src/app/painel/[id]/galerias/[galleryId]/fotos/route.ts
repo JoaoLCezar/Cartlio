@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { isUuid } from "@/lib/gallery-validation";
 import { createMediaReader } from "@/lib/media-storage";
+import { panelOriginalUrl } from "@/lib/media-storage-policy";
 import { readLimitedJson } from "@/lib/request-json";
 import { requireWorkspace } from "@/lib/workspace";
 
@@ -55,7 +56,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   }
 
   const { data, count, error } = await authorized.supabase.from("photos")
-    .select("id, object_path, original_filename, byte_size, deletion_requested_at, processing_status, sort_order, created_at", offset === 0 ? { count: "exact" } : {})
+    .select("id, object_path, storage_provider, original_filename, byte_size, deletion_requested_at, processing_status, sort_order, created_at", offset === 0 ? { count: "exact" } : {})
     .eq("tenant_id", tenantId).eq("gallery_id", galleryId).is("deletion_requested_at", null)
     .order("sort_order", { ascending: true }).order("created_at", { ascending: false }).order("id", { ascending: true })
     .range(offset, offset + photoPageSize - 1);
@@ -64,10 +65,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
   const ready = data.filter(photo => photo.processing_status === "ready");
   const derivedPaths = ready.map(photo => `${tenantId}/${galleryId}/${photo.id}.webp`);
   const media = createMediaReader(authorized.supabase);
-  const [thumbnailUrls, previewUrls, originalUrls] = await Promise.all([
+  const [thumbnailUrls, previewUrls] = await Promise.all([
     media.signPaths("thumbnail", derivedPaths, 900),
     media.signPaths("preview", derivedPaths, 900),
-    media.signPaths("original", ready.map(photo => photo.object_path), 900),
   ]);
   const photos = data.map((photo, index) => {
     if (photo.processing_status !== "ready") return { ...photo, position: offset + index, thumbnailUrl: null, previewUrl: null, originalUrl: null };
@@ -77,7 +77,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       position: offset + index,
       thumbnailUrl: thumbnailUrls.get(derivedPath) ?? null,
       previewUrl: previewUrls.get(derivedPath) ?? null,
-      originalUrl: originalUrls.get(photo.object_path) ?? null,
+      originalUrl: panelOriginalUrl(tenantId, galleryId, photo.id),
     };
   });
   return NextResponse.json({ photos, totalCount: offset === 0 ? count ?? 0 : null }, { headers: responseHeaders });
@@ -102,7 +102,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   }
 
   const { data, error } = await authorized.supabase.from("photos")
-    .select("id, object_path, original_filename, deletion_requested_at")
+    .select("id, object_path, storage_provider, original_filename, deletion_requested_at")
     .eq("tenant_id", tenantId).eq("gallery_id", galleryId).is("deletion_requested_at", null).in("id", ids as string[]);
   if (error) return responseError("Não foi possível preparar a exclusão das fotos.", 500);
   if (!data || data.length !== ids.length) return responseError("A galeria mudou. Atualize a página e tente novamente.", 409);

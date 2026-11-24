@@ -10,11 +10,11 @@ import { createPhotoUploadFlow } from "@/lib/photo-upload-flow";
 import { fetchAllGalleryPhotoIds } from "@/lib/gallery-photo-data";
 
 type Photo = {
-  id: string; object_path: string; original_filename: string; byte_size: number; deletion_requested_at: string | null;
+  id: string; object_path: string; storage_provider: "supabase" | "r2"; original_filename: string; byte_size: number; deletion_requested_at: string | null;
   processing_status: "pending" | "processing" | "ready" | "invalid" | "failed";
   thumbnailUrl: string | null; previewUrl: string | null; originalUrl: string | null; position: number;
 };
-type PhotoDeletionTarget = Pick<Photo, "id" | "object_path" | "original_filename" | "deletion_requested_at">;
+type PhotoDeletionTarget = Pick<Photo, "id" | "object_path" | "storage_provider" | "original_filename" | "deletion_requested_at">;
 
 const subscribeToHydration = () => () => {};
 const clientReady = () => true;
@@ -151,23 +151,26 @@ export function PhotoUploader({ tenantId, galleryId, photos, photoCount: initial
     }
   }
 
-  async function deletePhotoRecoverably(photo: PhotoDeletionTarget, supabase: ReturnType<typeof createClient>) {
+  async function deletePhotoRecoverably(photo: PhotoDeletionTarget, supabase: ReturnType<typeof createClient>): Promise<"deleted" | "pending"> {
     const scope = { p_tenant_id: tenantId, p_gallery_id: galleryId, p_photo_id: photo.id };
     const started = await supabase.rpc("begin_photo_deletion", scope);
     if (started.error) throw new Error("Não foi possível iniciar a exclusão. Verifique sua sessão e tente novamente.");
-    if (started.data === null) return;
+    if (started.data === null) return "deleted";
     if (typeof started.data !== "string") throw new Error("Não foi possível identificar a imagem para exclusão.");
     const derivedPath = `${tenantId}/${galleryId}/${photo.id}.webp`;
     for (const bucket of ["gallery-previews", "gallery-thumbnails"]) {
       const removedDerivative = await supabase.storage.from(bucket).remove([derivedPath]);
       if (removedDerivative.error) throw new Error("A exclusão ficou pendente. Use Concluir exclusão para tentar novamente.");
     }
+    if (photo.storage_provider === "r2") return "pending";
+    if (photo.storage_provider !== "supabase") throw new Error("O provedor deste original ainda não é compatível com exclusão.");
     const removedObject = await supabase.storage.from("gallery-originals").remove([started.data]);
     if (removedObject.error) throw new Error("A exclusão ficou pendente. Use Concluir exclusão para tentar novamente.");
     const finished = await supabase.rpc("finish_photo_deletion", scope);
     if (finished.error || finished.data !== true) {
       throw new Error("Não foi possível confirmar a exclusão. Use Concluir exclusão para tentar novamente.");
     }
+    return "deleted";
   }
 
   async function removePhoto(photo: PhotoDeletionTarget) {
@@ -175,13 +178,15 @@ export function PhotoUploader({ tenantId, galleryId, photos, photoCount: initial
     if (!photo.deletion_requested_at && !window.confirm(`Excluir permanentemente “${photo.original_filename}” desta galeria?`)) return;
     setRemovingPhotoId(photo.id); setError(""); setProgress("");
     try {
-      await deletePhotoRecoverably(photo, createClient());
+      const outcome = await deletePhotoRecoverably(photo, createClient());
       if (!photo.deletion_requested_at) {
         setLoadedPhotos(current => current.filter(item => item.id !== photo.id));
         setTotalPhotoCount(current => Math.max(0, current - 1));
         setSelectedPhotoIds(current => { const next = new Set(current); next.delete(photo.id); return next; });
       }
-      setProgress(`Imagem “${photo.original_filename}” excluída.`);
+      setProgress(outcome === "pending"
+        ? `Exclusão de “${photo.original_filename}” registrada; o original será removido após a janela de segurança.`
+        : `Imagem “${photo.original_filename}” excluída.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Não foi possível excluir a imagem. Tente novamente.");
     } finally {
@@ -262,24 +267,29 @@ export function PhotoUploader({ tenantId, galleryId, photos, photoCount: initial
     if (!window.confirm(`Excluir permanentemente ${count} ${count === 1 ? "imagem selecionada" : "imagens selecionadas"} desta galeria?`)) return;
     setPending(true); setError(""); setProgress("");
     const supabase = createClient();
-    const deletedIds = new Set<string>();
+    const handledIds = new Set<string>();
+    const pendingIds = new Set<string>();
     try {
       const targets = await fetchSelectedPhotoTargets(selectedIds);
       for (const photo of targets) {
         setRemovingPhotoId(photo.id);
-        await deletePhotoRecoverably(photo, supabase);
-        deletedIds.add(photo.id);
+        const outcome = await deletePhotoRecoverably(photo, supabase);
+        handledIds.add(photo.id);
+        if (outcome === "pending") pendingIds.add(photo.id);
       }
-      setProgress(`${deletedIds.size} ${deletedIds.size === 1 ? "imagem excluída" : "imagens excluídas"}.`);
+      const completedCount = handledIds.size - pendingIds.size;
+      const completedText = completedCount ? `${completedCount} ${completedCount === 1 ? "imagem excluída" : "imagens excluídas"}` : "";
+      const pendingText = pendingIds.size ? `${pendingIds.size} ${pendingIds.size === 1 ? "imagem aguardando remoção segura" : "imagens aguardando remoção segura"}` : "";
+      setProgress([completedText, pendingText].filter(Boolean).join("; ") + ".");
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Não foi possível concluir a exclusão das imagens selecionadas.");
-      if (deletedIds.size > 0) setProgress(`${deletedIds.size} de ${count} imagens excluídas. As demais continuam na galeria ou em Exclusões pendentes.`);
+      if (handledIds.size > 0) setProgress(`${handledIds.size} de ${count} solicitações foram registradas. As demais continuam na galeria ou em Exclusões pendentes.`);
     } finally {
-      if (deletedIds.size > 0) {
-        setLoadedPhotos(current => current.filter(photo => !deletedIds.has(photo.id)));
-        setTotalPhotoCount(current => Math.max(0, current - deletedIds.size));
+      if (handledIds.size > 0) {
+        setLoadedPhotos(current => current.filter(photo => !handledIds.has(photo.id)));
+        setTotalPhotoCount(current => Math.max(0, current - handledIds.size));
       }
-      setSelectedPhotoIds(current => new Set([...current].filter(id => !deletedIds.has(id))));
+      setSelectedPhotoIds(current => new Set([...current].filter(id => !handledIds.has(id))));
       startRefresh(() => router.refresh());
       setRemovingPhotoId(null);
       setPending(false);
@@ -429,6 +439,7 @@ export function PhotoUploader({ tenantId, galleryId, photos, photoCount: initial
       <p className="mt-2 text-sm text-stone-400">Estas imagens aguardam a conclusão da exclusão. Você pode tentar novamente mesmo depois de fechar a página.</p>
       <ul className="mt-4 space-y-4">{pendingDeletions.map(photo => <li key={photo.id}>
         <p className="break-words text-sm">{photo.original_filename}</p>
+        {photo.storage_provider === "r2" && <p className="mt-1 text-xs text-stone-500">O original será removido automaticamente depois que a autorização temporária de envio vencer e a ausência for confirmada.</p>}
         <button type="button" className="button mt-2" disabled={busy} onClick={() => removePhoto(photo)} aria-label={`Concluir exclusão ${photo.original_filename}`}>
           {removingPhotoId === photo.id ? "Excluindo…" : "Concluir exclusão"}
         </button>

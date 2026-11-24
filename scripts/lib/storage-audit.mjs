@@ -1,3 +1,5 @@
+import { createR2StorageInventory } from "./r2-storage-inventory.mjs";
+
 export const storageAuditBuckets = ["gallery-originals", "gallery-previews", "gallery-thumbnails", "gallery-brand-assets"];
 const pageSize = 100;
 const databasePageSize = 1000;
@@ -8,6 +10,7 @@ export function parseStorageAuditArguments(argv) {
   let mode = null;
   let includePaths = false;
   let includeUsage = false;
+  let includeR2 = false;
   let snapshotPath = null;
   let comparePath = null;
   for (let index = 0; index < argv.length; index += 1) {
@@ -16,15 +19,16 @@ export function parseStorageAuditArguments(argv) {
     else if (argument === "--tenant" && !tenantId && argv[index + 1]) tenantId = argv[++index];
     else if (argument === "--details" && !includePaths) includePaths = true;
     else if (argument === "--usage" && !includeUsage) includeUsage = true;
+    else if (argument === "--r2" && !includeR2) includeR2 = true;
     else if (argument === "--snapshot" && !snapshotPath && argv[index + 1]) snapshotPath = argv[++index];
     else if (argument === "--compare" && !comparePath && argv[index + 1]) comparePath = argv[++index];
-    else throw new Error("Uso: npm run storage:audit -- --local [--tenant UUID] [--details] [--usage] [--snapshot FILE] [--compare FILE]");
+    else throw new Error("Uso: npm run storage:audit -- --local [--tenant UUID] [--details] [--usage] [--r2] [--snapshot FILE] [--compare FILE]");
   }
   if (mode !== "--local") throw new Error("A auditoria exige o Supabase local: informe --local.");
   if (tenantId && !uuidPattern.test(tenantId)) throw new Error("Workspace inválido.");
   if ((comparePath || snapshotPath) && !includeUsage) throw new Error("Snapshots e comparações exigem --usage.");
   if (snapshotPath && comparePath && snapshotPath === comparePath) throw new Error("Snapshot e referência devem usar arquivos diferentes.");
-  return { mode, tenantId: tenantId?.toLowerCase() ?? null, includePaths, includeUsage, snapshotPath, comparePath };
+  return { mode, tenantId: tenantId?.toLowerCase() ?? null, includePaths, includeUsage, includeR2, snapshotPath, comparePath };
 }
 
 export function compareStorageUsage(current, baseline) {
@@ -39,7 +43,14 @@ export function compareStorageUsage(current, baseline) {
   const baselineTime = Date.parse(baseline.generated_at);
   if (currentTime < baselineTime) throw new Error("A auditoria atual não pode ser anterior ao snapshot de referência.");
 
-  const sizesComplete = current.usage.size_complete && baseline.usage.size_complete &&
+  const r2Current = current.provider_inventory?.r2;
+  const r2Baseline = baseline.provider_inventory?.r2;
+  const r2InventoryRequired = r2Current?.physical_objects_included === true || r2Baseline?.physical_objects_included === true ||
+    (r2Current?.photos ?? 0) > 0 || (r2Current?.upload_sessions ?? 0) > 0 ||
+    (r2Baseline?.photos ?? 0) > 0 || (r2Baseline?.upload_sessions ?? 0) > 0;
+  const r2InventoryComparable = !r2InventoryRequired ||
+    r2Current?.physical_objects_included === true && r2Baseline?.physical_objects_included === true;
+  const sizesComplete = current.usage.size_complete && baseline.usage.size_complete && r2InventoryComparable &&
     storageAuditBuckets.every(bucket => current.buckets[bucket].size_complete && baseline.buckets[bucket].size_complete) &&
     [...current.usage.workspaces, ...baseline.usage.workspaces].every(workspace => workspace.physical_storage.size_complete);
   const compareBytes = (currentBytes, baselineBytes) => ({
@@ -49,9 +60,9 @@ export function compareStorageUsage(current, baseline) {
       ? currentBytes - baselineBytes
       : null,
   });
-  const buckets = Object.fromEntries(storageAuditBuckets.map(bucket => [bucket, compareBytes(
-    current.buckets[bucket].bytes,
-    baseline.buckets[bucket].bytes,
+  const buckets = Object.fromEntries([...storageAuditBuckets, "r2-originals"].map(bucket => [bucket, compareBytes(
+    bucket === "r2-originals" ? r2Current?.bytes ?? null : current.buckets[bucket].bytes,
+    bucket === "r2-originals" ? r2Baseline?.bytes ?? null : baseline.buckets[bucket].bytes,
   )]));
   const baselineWorkspaces = new Map(baseline.usage.workspaces.map(workspace => [workspace.tenant_id.toLowerCase(), workspace]));
   const workspaces = current.usage.workspaces.map(workspace => {
@@ -161,10 +172,24 @@ async function listRows(client, table, columns, tenantId, tenantColumn = "tenant
   return rows;
 }
 
-export function compareStorageInventory({ photos, uploadSessions, objectsByBucket, tenants = [] }, includePaths = false, includeUsage = false) {
+export function compareStorageInventory({ photos, uploadSessions, objectsByBucket, tenants = [], r2Objects = null }, includePaths = false, includeUsage = false) {
+  const providerOf = row => row.storage_provider ?? "supabase";
+  const r2InventoryIncluded = r2Objects instanceof Map;
+  const unsupportedProviders = new Set([
+    ...photos.map(providerOf),
+    ...uploadSessions.map(providerOf),
+  ].filter(provider => provider !== "supabase" && !(provider === "r2" && r2InventoryIncluded)));
+  const providerCounts = provider => ({
+    photos: photos.filter(photo => providerOf(photo) === provider).length,
+    upload_sessions: uploadSessions.filter(session => providerOf(session) === provider).length,
+  });
+  const supabasePhotos = photos.filter(photo => providerOf(photo) === "supabase");
+  const r2Photos = photos.filter(photo => providerOf(photo) === "r2");
+  const supabaseSessions = uploadSessions.filter(session => providerOf(session) === "supabase");
+  const r2Sessions = uploadSessions.filter(session => providerOf(session) === "r2");
   const originalReferences = new Set([
-    ...photos.map(photo => photo.object_path),
-    ...uploadSessions.filter(session => session.state !== "canceled").map(session => session.object_path),
+    ...supabasePhotos.map(photo => photo.object_path),
+    ...supabaseSessions.filter(session => session.state !== "canceled").map(session => session.object_path),
   ]);
   const brandAssetReferences = new Set(tenants.map(tenant => tenant.brand_logo_path).filter(Boolean));
   const derivativeReferences = new Set(photos.map(photo => `${photo.tenant_id}/${photo.gallery_id}/${photo.id}.webp`));
@@ -172,7 +197,8 @@ export function compareStorageInventory({ photos, uploadSessions, objectsByBucke
   const previews = objectsByBucket["gallery-previews"];
   const thumbnails = objectsByBucket["gallery-thumbnails"];
   const brandAssets = objectsByBucket["gallery-brand-assets"] ?? new Set();
-  const activePhotos = photos.filter(photo => !photo.deletion_requested_at);
+  const activePhotos = supabasePhotos.filter(photo => !photo.deletion_requested_at);
+  const activeR2Photos = r2Photos.filter(photo => !photo.deletion_requested_at);
   const readyPhotos = activePhotos.filter(photo => photo.processing_status === "ready");
   const details = [];
   let detailsTruncated = false;
@@ -192,12 +218,40 @@ export function compareStorageInventory({ photos, uploadSessions, objectsByBucke
       photo => `${photo.tenant_id}/${photo.gallery_id}/${photo.id}.webp`, "gallery-previews"),
     ready_photos_missing_thumbnails: countMissingPhotos(readyPhotos, thumbnails, "ready_photos_missing_thumbnails", addDetail,
       photo => `${photo.tenant_id}/${photo.gallery_id}/${photo.id}.webp`, "gallery-thumbnails"),
+    orphaned_r2_originals: r2InventoryIncluded
+      ? countUnreferenced(r2Objects, new Set([
+        ...r2Photos.map(photo => photo.object_path),
+        ...r2Sessions.filter(session => session.state !== "canceled").map(session => session.object_path),
+      ]), "r2-originals", addDetail, "orphaned_r2_originals")
+      : 0,
+    r2_photos_missing_originals: r2InventoryIncluded
+      ? countMissingPhotos(activeR2Photos, r2Objects, "r2_photos_missing_originals", addDetail, photo => photo.object_path, "r2-originals")
+      : 0,
+    r2_original_identity_mismatches: r2InventoryIncluded
+      ? countR2OriginalIdentityMismatches(r2Photos, r2Objects, addDetail)
+      : 0,
   };
+  findings.r2_upload_session_identity_mismatches = r2InventoryIncluded
+    ? countR2UploadSessionIdentityMismatches(r2Sessions, r2Objects, addDetail)
+    : 0;
   findings.workspaces_missing_brand_assets = countMissingBrandAssets(tenants, brandAssets, addDetail);
   findings.total = Object.values(findings).reduce((sum, count) => sum + count, 0);
 
   const result = {
     database: { photos_examined: photos.length, upload_sessions_examined: uploadSessions.length, workspaces_examined: tenants.length },
+    provider_inventory: {
+      supabase: providerCounts("supabase"),
+      r2: {
+        ...providerCounts("r2"),
+        physical_objects_included: r2InventoryIncluded,
+        ...(r2InventoryIncluded ? summarizeBucket(r2Objects) : { objects: null, bytes: null, unknown_size_objects: null, size_complete: false }),
+      },
+      unsupported: [...unsupportedProviders].filter(provider => provider !== "r2").map(provider => ({
+        provider,
+        ...providerCounts(provider),
+      })),
+    },
+    audit_complete: unsupportedProviders.size === 0,
     buckets: {
       "gallery-originals": summarizeBucket(originals),
       "gallery-previews": summarizeBucket(previews),
@@ -209,7 +263,16 @@ export function compareStorageInventory({ photos, uploadSessions, objectsByBucke
   if (includeUsage) result.usage = summarizeWorkspaceUsage({
     photos, uploadSessions, tenants,
     objectsByBucket: { ...objectsByBucket, "gallery-brand-assets": brandAssets },
+    r2Objects,
   });
+  if (includeUsage && !result.audit_complete) {
+    result.usage.total_physical_bytes = null;
+    result.usage.size_complete = false;
+    for (const workspace of result.usage.workspaces) {
+      workspace.physical_storage.total_bytes = null;
+      workspace.physical_storage.size_complete = false;
+    }
+  }
   if (includePaths) {
     result.details = details;
     result.details_truncated = detailsTruncated;
@@ -240,7 +303,8 @@ function addBytes(current, next) {
   return current === null || next === null || !Number.isSafeInteger(current + next) ? null : current + next;
 }
 
-function summarizeWorkspaceUsage({ photos, uploadSessions, tenants, objectsByBucket }) {
+function summarizeWorkspaceUsage({ photos, uploadSessions, tenants, objectsByBucket, r2Objects = null }) {
+  const usageBuckets = [...storageAuditBuckets, "r2-originals"];
   const workspaceRows = new Map(tenants.map(tenant => [tenant.id.toLowerCase(), {
     tenant_id: tenant.id,
     quota_limit_bytes: safeBytes(tenant.storage_limit_bytes),
@@ -248,7 +312,7 @@ function summarizeWorkspaceUsage({ photos, uploadSessions, tenants, objectsByBuc
     reserved_bytes: 0,
     photo_count: 0,
     active_upload_count: 0,
-    physical_buckets: Object.fromEntries(storageAuditBuckets.map(bucket => [bucket, { objects: 0, bytes: 0, unknown_size_objects: 0 }])),
+    physical_buckets: Object.fromEntries(usageBuckets.map(bucket => [bucket, { objects: 0, bytes: 0, unknown_size_objects: 0 }])),
   }]));
 
   for (const photo of photos) {
@@ -280,6 +344,23 @@ function summarizeWorkspaceUsage({ photos, uploadSessions, tenants, objectsByBuc
         continue;
       }
       const physical = workspace.physical_buckets[bucket];
+      physical.objects += 1;
+      if (size === null) physical.unknown_size_objects += 1;
+      else physical.bytes = addBytes(physical.bytes, size);
+    }
+  }
+
+  if (r2Objects instanceof Map) {
+    for (const [path, object] of r2Objects) {
+      const tenantId = path.split("/")[0].toLowerCase();
+      const workspace = workspaceRows.get(tenantId);
+      const size = Number.isSafeInteger(object?.size) && object.size >= 0 ? object.size : null;
+      if (!workspace) {
+        if (size === null) unassignedUnknownSizeObjects += 1;
+        else unassignedPhysicalBytes = addBytes(unassignedPhysicalBytes, size);
+        continue;
+      }
+      const physical = workspace.physical_buckets["r2-originals"];
       physical.objects += 1;
       if (size === null) physical.unknown_size_objects += 1;
       else physical.bytes = addBytes(physical.bytes, size);
@@ -330,13 +411,13 @@ function summarizeWorkspaceUsage({ photos, uploadSessions, tenants, objectsByBuc
   };
 }
 
-function countUnreferenced(paths, references, bucket, addDetail) {
+function countUnreferenced(paths, references, bucket, addDetail, findingOverride = null) {
   let count = 0;
   const objectPaths = paths instanceof Map ? paths.keys() : paths;
   for (const path of objectPaths) {
     if (references.has(path)) continue;
     count += 1;
-    const finding = bucket === "gallery-brand-assets" ? "orphaned_brand_assets" : `orphaned_${bucket.replace("gallery-", "")}`;
+    const finding = findingOverride ?? (bucket === "gallery-brand-assets" ? "orphaned_brand_assets" : `orphaned_${bucket.replace("gallery-", "")}`);
     addDetail({ finding, bucket, object_path: path });
   }
   return count;
@@ -349,6 +430,46 @@ function countMissingPhotos(photos, objects, finding, addDetail, getPath, bucket
     if (objects.has(path)) continue;
     count += 1;
     addDetail({ finding, bucket, photo_id: photo.id, object_path: path });
+  }
+  return count;
+}
+
+function countR2OriginalIdentityMismatches(photos, objects, addDetail) {
+  let count = 0;
+  for (const photo of photos) {
+    const object = objects.get(photo.object_path);
+    if (!object) continue;
+    const mismatchFields = [];
+    if (!Number.isSafeInteger(object.size) || object.size !== photo.byte_size) mismatchFields.push("size");
+    if (typeof photo.storage_etag !== "string" || object.etag !== photo.storage_etag) mismatchFields.push("etag");
+    if (!mismatchFields.length) continue;
+    count += 1;
+    addDetail({
+      finding: "r2_original_identity_mismatches",
+      bucket: "r2-originals",
+      photo_id: photo.id,
+      object_path: photo.object_path,
+      mismatch_fields: mismatchFields,
+    });
+  }
+  return count;
+}
+
+function countR2UploadSessionIdentityMismatches(sessions, objects, addDetail) {
+  let count = 0;
+  for (const session of sessions) {
+    const object = objects.get(session.object_path);
+    if (!object) continue;
+    const expectedBytes = safeBytes(session.byte_size);
+    if (expectedBytes !== null && object.size === expectedBytes) continue;
+    count += 1;
+    addDetail({
+      finding: "r2_upload_session_identity_mismatches",
+      bucket: "r2-originals",
+      upload_session_id: session.id,
+      object_path: session.object_path,
+      mismatch_fields: ["size"],
+    });
   }
   return count;
 }
@@ -370,17 +491,18 @@ function countMissingBrandAssets(tenants, objects, addDetail) {
 
 export async function listStorageReferenceRows(client, tenantId = null) {
   const [photos, uploadSessions, tenants] = await Promise.all([
-    listRows(client, "photos", "id,tenant_id,gallery_id,object_path,byte_size,processing_status,deletion_requested_at", tenantId),
-    listRows(client, "upload_sessions", "id,tenant_id,object_path,state,reserved_bytes", tenantId),
+    listRows(client, "photos", "id,tenant_id,gallery_id,object_path,byte_size,storage_provider,storage_etag,processing_status,deletion_requested_at", tenantId),
+    listRows(client, "upload_sessions", "id,tenant_id,object_path,state,byte_size,reserved_bytes,storage_provider", tenantId),
     listRows(client, "tenants", "id,brand_logo_path,storage_limit_bytes", tenantId, "id"),
   ]);
   return { photos, uploadSessions, tenants };
 }
 
-export async function auditStorage(client, tenantId = null, { includePaths = false, includeUsage = false } = {}) {
-  const [references, bucketObjects] = await Promise.all([
+export async function auditStorage(client, tenantId = null, { includePaths = false, includeUsage = false, includeR2 = false, r2Inventory = null } = {}) {
+  const [references, bucketObjects, r2Objects] = await Promise.all([
     listStorageReferenceRows(client, tenantId),
     Promise.all(storageAuditBuckets.map(bucket => listStorageObjects(client.storage, bucket))),
+    includeR2 ? (r2Inventory ?? createR2StorageInventory())() : Promise.resolve(null),
   ]);
   const objectsByBucket = Object.fromEntries(storageAuditBuckets.map((bucket, index) => [bucket, bucketObjects[index]]));
   if (tenantId) {
@@ -388,5 +510,8 @@ export async function auditStorage(client, tenantId = null, { includePaths = fal
       objectsByBucket[bucket] = new Map([...objectsByBucket[bucket]].filter(([path]) => path.startsWith(`${tenantId}/`)));
     }
   }
-  return compareStorageInventory({ ...references, objectsByBucket }, includePaths, includeUsage);
+  const scopedR2Objects = tenantId && r2Objects instanceof Map
+    ? new Map([...r2Objects].filter(([path]) => path.startsWith(`${tenantId}/`)))
+    : r2Objects;
+  return compareStorageInventory({ ...references, objectsByBucket, r2Objects: scopedR2Objects }, includePaths, includeUsage);
 }

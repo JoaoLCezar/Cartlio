@@ -1,5 +1,5 @@
 import { addAbortSignal, Readable } from "node:stream";
-import { GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { createR2StorageClient, isStrongR2Etag, r2OriginalIdentity } from "./r2-storage-client.mjs";
 
@@ -52,6 +52,44 @@ export function createR2OriginalAccess(env = process.env, { requestHandler } = {
     return output;
   }
 
+  async function deleteVerifiedOriginal(photo) {
+    const { path, bytes, type } = r2OriginalIdentity(photo);
+    const etag = photo.storage_etag;
+    if (!isStrongR2Etag(etag)) throw new Error("UPLOAD_MISMATCH");
+
+    let current;
+    try {
+      current = await client.send(new HeadObjectCommand({ Bucket: bucket, Key: path, IfMatch: etag }));
+    } catch (error) {
+      const status = error?.$metadata?.httpStatusCode;
+      if (status === 404 || error?.name === "NotFound" || error?.name === "NoSuchKey") {
+        return { absent: true, wasPresent: false };
+      }
+      if (status === 412) throw new Error("R2_ORIGINAL_CHANGED");
+      throw new Error("R2_ORIGINAL_UNAVAILABLE");
+    }
+
+    if (current.ContentLength !== bytes || current.ContentType !== type || current.ETag !== etag) {
+      throw new Error("R2_ORIGINAL_CHANGED");
+    }
+    try {
+      await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: path }));
+    } catch {
+      throw new Error("R2_ORIGINAL_UNAVAILABLE");
+    }
+
+    try {
+      await client.send(new HeadObjectCommand({ Bucket: bucket, Key: path }));
+      return { absent: false, wasPresent: true };
+    } catch (error) {
+      const status = error?.$metadata?.httpStatusCode;
+      if (status === 404 || error?.name === "NotFound" || error?.name === "NoSuchKey") {
+        return { absent: true, wasPresent: true };
+      }
+      throw new Error("R2_ORIGINAL_UNAVAILABLE");
+    }
+  }
+
   return {
     async signUpload(reservation) {
       const { path, bytes, type } = r2OriginalIdentity(reservation);
@@ -75,6 +113,7 @@ export function createR2OriginalAccess(env = process.env, { requestHandler } = {
     },
 
     openVerifiedOriginal,
+    deleteVerifiedOriginal,
 
     async readVerifiedOriginal(photo) {
       const body = await openVerifiedOriginal(photo, { timeoutMs: 30_000 });

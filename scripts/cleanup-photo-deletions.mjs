@@ -13,14 +13,24 @@ if (tenantId && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
 
 try {
   const client = maintenanceClient(mode);
-  let query = client.from("photos").select("id, tenant_id, gallery_id, object_path")
+  let query = client.from("photos").select("id, tenant_id, gallery_id, object_path, storage_provider, storage_etag, content_type, byte_size, created_at, storage_delete_absent_at")
     .not("deletion_requested_at", "is", null)
     .order("deletion_requested_at").order("id").limit(100);
   if (tenantId) query = query.eq("tenant_id", tenantId);
   const { data: photos, error } = await query;
   if (error) throw new Error("Não foi possível consultar exclusões pendentes.");
 
-  const counts = await cleanupPendingPhotoDeletions(client, photos);
+  const r2Photos = photos.filter(photo => photo.storage_provider === "r2");
+  let uploadSessions = [];
+  if (r2Photos.length) {
+    const { data, error: sessionsError } = await client.from("upload_sessions")
+      .select("id, tenant_id, expires_at").eq("storage_provider", "r2")
+      .in("id", r2Photos.map(photo => photo.id));
+    if (sessionsError || !data) throw new Error("Não foi possível consultar a validade dos envios R2.");
+    uploadSessions = data;
+  }
+
+  const counts = await cleanupPendingPhotoDeletions(client, photos, { uploadSessions });
   console.log(JSON.stringify(counts));
   if (counts.failed) process.exitCode = 1;
 } catch {

@@ -9,7 +9,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { createInterface } from "node:readline";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
-import { backupBuckets, backupBucketsForManifest, copyWorkspaceMigrations, verifyBackup } from "./lib/backup.mjs";
+import { assertR2BackupInventory, backupBuckets, backupBucketsForManifest, copyWorkspaceMigrations, verifyBackup } from "./lib/backup.mjs";
 import { prepareBackupDirectory } from "./lib/backup-encryption.mjs";
 import { preserveNextTypeFiles } from "./lib/preserve-next-type-files.mjs";
 
@@ -251,11 +251,12 @@ export function rowCountDifferences(expectedRows, actualRows) {
   });
 }
 
-export function auditRestoredPhotoStorage(photos, storageFiles, tenants = []) {
+export function auditRestoredPhotoStorage(photos, storageFiles, tenants = [], r2StorageFiles = []) {
   const bucketPaths = Object.fromEntries(backupBuckets.map(bucket => [
     bucket,
     new Set((storageFiles[bucket] ?? []).map(file => file.path)),
   ]));
+  for (const file of r2StorageFiles) bucketPaths["gallery-originals"].add(file.path);
   const samplesByTenant = new Map();
   let activePhotos = 0;
   let readyPhotos = 0;
@@ -358,7 +359,7 @@ function projectContainer(workdir, projectId) {
   return expectedName;
 }
 
-async function restoreStorage(client, backupRoot, manifest) {
+export async function restoreStorage(client, backupRoot, manifest) {
   const hashes = new Map(manifest.files.map(file => [file.path, file.sha256]));
   for (const bucket of backupBucketsForManifest(manifest)) {
     const bucketStorage = client.storage.from(bucket);
@@ -381,6 +382,84 @@ async function restoreStorage(client, backupRoot, manifest) {
       }
     }
   }
+
+  const originalBucket = client.storage.from("gallery-originals");
+  for (const item of manifest.r2_storage_files ?? []) {
+    const fullPath = join(backupRoot, "storage", "r2-originals", ...item.path.split("/"));
+    const bytes = await readFile(fullPath);
+    if (bytes.length !== item.bytes) throw new Error("Um original R2 do backup tem tamanho inválido.");
+    const { error } = await originalBucket.upload(item.path, bytes, {
+      contentType: item.content_type,
+      cacheControl: "3600",
+      upsert: false,
+    });
+    if (error) throw new Error("Falha ao copiar um original R2 para o Storage temporário.");
+    const { data, error: downloadError } = await originalBucket.download(item.path);
+    if (downloadError || !data) throw new Error("Não foi possível validar um original R2 restaurado.");
+    const restored = Buffer.from(await data.arrayBuffer());
+    const expectedHash = hashes.get(`storage/r2-originals/${item.path}`);
+    if (restored.length !== item.bytes || createHash("sha256").update(restored).digest("hex") !== expectedHash) {
+      throw new Error("A validação dos bytes de um original R2 falhou.");
+    }
+  }
+}
+
+export async function localizeRestoredR2Photos(client, r2StorageFiles) {
+  if (!Array.isArray(r2StorageFiles)) throw new Error("O backup contém um inventário R2 inválido.");
+  const photos = [];
+  const pageSize = 500;
+  for (let offset = 0; ; offset += pageSize) {
+    const { data, error } = await client.from("photos")
+      .select("id, tenant_id, gallery_id, object_path, storage_provider, content_type, byte_size, storage_etag, deletion_requested_at")
+      .eq("storage_provider", "r2").order("id", { ascending: true }).range(offset, offset + pageSize - 1);
+    if (error || !data) throw new Error("Não foi possível conferir as fotos R2 restauradas.");
+    photos.push(...data);
+    if (data.length < pageSize) break;
+  }
+
+  const objects = new Map(r2StorageFiles.map(file => [file.path, { size: file.bytes, etag: file.etag }]));
+  assertR2BackupInventory(photos, objects);
+  const filesByPath = new Map(r2StorageFiles.map(file => [file.path, file]));
+  if (photos.some(photo => {
+    const file = filesByPath.get(photo.object_path);
+    return file ? file.content_type !== photo.content_type : photo.deletion_requested_at == null;
+  })) {
+    throw new Error("Os metadados dos originais R2 não correspondem às fotos restauradas.");
+  }
+
+  const activeSessions = await client.from("upload_sessions")
+    .select("id", { count: "exact", head: true })
+    .eq("storage_provider", "r2")
+    .in("state", ["reserved", "canceling"]);
+  if (activeSessions.error || !Number.isSafeInteger(activeSessions.count) || activeSessions.count > 0) {
+    throw new Error("O backup contém envios R2 ativos e não pode ser localizado na instância temporária.");
+  }
+
+  if (photos.length) {
+    const { data, error } = await client.from("photos")
+      .update({ storage_provider: "supabase", storage_etag: null, storage_delete_absent_at: null })
+      .eq("storage_provider", "r2")
+      .select("id");
+    if (error || !Array.isArray(data) || data.length !== photos.length) {
+      throw new Error("Não foi possível preparar as fotos R2 na instância temporária.");
+    }
+  }
+
+  const sessions = await client.from("upload_sessions")
+    .update({
+      storage_provider: "supabase",
+      r2_put_authorized_at: null,
+      r2_multipart_state: null,
+      r2_multipart_upload_id: null,
+      r2_multipart_started_at: null,
+      r2_multipart_claimed_at: null,
+    })
+    .eq("storage_provider", "r2")
+    .select("id");
+  if (sessions.error || !Array.isArray(sessions.data)) {
+    throw new Error("Não foi possível preparar os envios R2 na instância temporária.");
+  }
+  return photos.length;
 }
 
 async function countAuthUsers(client) {
@@ -424,7 +503,7 @@ async function auditRestoredPhotoRecords(client, manifest) {
       .order("id", { ascending: true })
       .range(offset, offset + pageSize - 1);
     if (error) throw new Error("Não foi possível conferir os arquivos ligados às fotos restauradas.");
-    const page = auditRestoredPhotoStorage(data ?? [], manifest.storage_files);
+    const page = auditRestoredPhotoStorage(data ?? [], manifest.storage_files, [], manifest.r2_storage_files ?? []);
     result.active_photos += page.active_photos;
     result.ready_photos += page.ready_photos;
     result.missing_originals += page.missing_originals;
@@ -444,7 +523,7 @@ async function auditRestoredPhotoRecords(client, manifest) {
             .order("id", { ascending: true })
             .range(tenantOffset, tenantOffset + pageSize - 1);
           if (tenantError) throw new Error("Não foi possível conferir os logos restaurados.");
-          const tenantPage = auditRestoredPhotoStorage([], manifest.storage_files, tenants ?? []);
+          const tenantPage = auditRestoredPhotoStorage([], manifest.storage_files, tenants ?? [], manifest.r2_storage_files ?? []);
           result.brand_logos_examined += tenantPage.brand_logos_examined;
           result.missing_brand_assets += tenantPage.missing_brand_assets;
           if (!tenants || tenants.length < pageSize) break;
@@ -591,7 +670,7 @@ async function runRestoreCheckDirectory(options) {
       valid: true,
       complete: true,
       dry_run: true,
-      restore_order: ["roles.sql", migrationRestoreStep, "auth-data.sql", "data.sql", "Storage API objects"],
+      restore_order: ["roles.sql", migrationRestoreStep, "auth-data.sql", "data.sql", "Supabase Storage objects", "R2 originals copied into temporary Supabase Storage"],
       target: "instância Supabase descartável",
     };
   }
@@ -641,6 +720,7 @@ async function runRestoreCheckDirectory(options) {
     const actualBuckets = new Set((buckets ?? []).map(bucket => bucket.name));
     if (backupBucketsForManifest(manifest).some(bucket => !actualBuckets.has(bucket))) throw new Error("A instância descartável não contém todos os buckets do backup.");
     await restoreStorage(client, options.backup, manifest);
+    if (manifest.format_version >= 5) await localizeRestoredR2Photos(client, manifest.r2_storage_files ?? []);
     const existingData = await verifyExistingRestoredMember({
       client,
       apiUrl: status.API_URL,
@@ -653,7 +733,8 @@ async function runRestoreCheckDirectory(options) {
       restored: true,
       auth_users: authUsers,
       database_tables: expectedRows.length,
-      storage_objects: Object.values(manifest.storage_objects).reduce((sum, value) => sum + value, 0),
+      storage_objects: Object.values(manifest.storage_objects).reduce((sum, value) => sum + value, 0) + (manifest.r2_storage_objects ?? 0),
+      r2_storage_objects: manifest.r2_storage_objects ?? 0,
       existing_data: existingData,
       isolated_project: true,
       backup_created_at: manifest.created_at,

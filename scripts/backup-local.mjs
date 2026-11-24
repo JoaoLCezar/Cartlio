@@ -5,12 +5,32 @@ import { basename, dirname, join, resolve } from "node:path";
 import { mkdir, realpath, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { createClient } from "@supabase/supabase-js";
-import { assertBackupOutsideProject, backupBuckets, copyStorageBucket, copyWorkspaceMigrations, localDatabaseDumps, parseBackupArguments, verifyBackup, writeBackupManifest } from "./lib/backup.mjs";
+import { assertBackupOutsideProject, assertBackupStorageComplete, backupBuckets, copyR2Originals, copyStorageBucket, copyWorkspaceMigrations, localDatabaseDumps, parseBackupArguments, verifyBackup, writeBackupManifest } from "./lib/backup.mjs";
 import { encryptBackupDirectory, prepareBackupDirectory, requireBackupPassphrase } from "./lib/backup-encryption.mjs";
+import { createR2OriginalAccess } from "./lib/r2-originals.mjs";
+import { createR2StorageInventory } from "./lib/r2-storage-inventory.mjs";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const defaultOutput = join(process.env.LOCALAPPDATA ?? homedir(), "CartlioBackups");
 const windows = process.platform === "win32";
+const r2EnvironmentKeys = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"];
+
+function hasAnyR2Configuration(env = process.env) {
+  return r2EnvironmentKeys.some(key => typeof env[key] === "string" && env[key].trim().length > 0);
+}
+
+async function listR2Photos(client) {
+  const photos = [];
+  for (let offset = 0; ; offset += 500) {
+    const { data, error } = await client.from("photos")
+      .select("id, tenant_id, gallery_id, object_path, storage_provider, content_type, byte_size, storage_etag, deletion_requested_at")
+      .eq("storage_provider", "r2").order("id").range(offset, offset + 499);
+    if (error || !data) throw new Error("Não foi possível consultar os originais R2 para o backup.");
+    photos.push(...data);
+    if (data.length < 500) break;
+  }
+  return photos;
+}
 
 function runSupabase(args) {
   try {
@@ -57,9 +77,10 @@ function restoreInstructions() {
   return [
     "# Restauração deste backup",
     "",
-    "Este backup contém dumps lógicos do Postgres, dados dos usuários do Supabase Auth, uma cópia das migrations da aplicação e os bytes dos quatro buckets privados do Quadrics. `auth-data.sql` exporta Auth separadamente; `data.sql` inclui somente o schema `public`; os objetos do Storage são copiados pela API, sem duplicar `storage.objects` no dump SQL. Importe Auth antes dos dados da aplicação. Nunca importe estes dados sobre o banco de desenvolvimento atual ou um projeto de produção.",
+    "Este backup contém dumps lógicos do Postgres, dados dos usuários do Supabase Auth, uma cópia das migrations da aplicação, os bytes dos quatro buckets privados do Supabase e, quando R2 estiver configurado, os originais R2 registrados no banco. `auth-data.sql` exporta Auth separadamente; `data.sql` inclui somente o schema `public`; os objetos do Supabase são copiados pela API, sem duplicar `storage.objects` no dump SQL. Importe Auth antes dos dados da aplicação. Nunca importe estes dados sobre o banco de desenvolvimento atual ou um projeto de produção.",
     "",
-    "A rotina de restauração inicia uma instância Supabase descartável, reaplica as migrations arquivadas, importa usuários Auth e dados da aplicação, recria os buckets e restaura os objetos pela API. Execute `npm run backup:restore-check -- --backup <diretório-do-backup>` para comparar linhas e hashes. A rotina remove somente a instância temporária; ela não altera o projeto local `cartlio`.",
+    "A rotina de restauração inicia uma instância Supabase descartável, reaplica as migrations arquivadas, importa usuários Auth e dados da aplicação, recria os buckets e restaura os objetos pela API. Para validar o acesso sem credenciais R2, ela copia os originais R2 para `gallery-originals` e altera o provedor somente nas linhas da instância temporária. Execute `npm run backup:restore-check -- --backup <diretório-do-backup>` para comparar linhas e hashes. A rotina remove somente a instância temporária; ela não altera o projeto local `cartlio`.",
+    "Em uma recuperação de produção com R2 ativo, restaure os arquivos de `storage/r2-originals` no bucket R2 privado de destino, preserve as chaves e valide tamanho, ETag e hash antes de reabrir o serviço. Se o bucket de destino gerar ETags diferentes, atualize `photos.storage_etag` com o ETag observado somente após validar os hashes. Não aplique a conversão temporária para Supabase na base de produção.",
     "O ensaio também confere se fotos ativas e derivados prontos apontam para objetos do backup. Quando encontra um membro com e-mail, usa um link temporário na instância descartável para verificar acesso aos dados e arquivos existentes, sem alterar a senha original.",
     "Para testar login pela interface, envio e processamento de fotos, preview privado, seleção do cliente e download autorizado do original, execute `npm run backup:restore-e2e -- --backup <diretório-do-backup>`. O ensaio não altera o projeto original; ele usa uma instância descartável, cria dados sintéticos e, para testar um membro restaurado sem credenciais conhecidas, troca a senha somente na cópia temporária.",
     "A restauração local reaplica as configurações das roles, exceto a permissão gerenciada do Supabase para `log_min_messages`, que o papel local `postgres` não pode conceder. Essa ACL pertence à plataforma, não aos dados das galerias.",
@@ -77,7 +98,7 @@ async function runBackup(argv) {
   const passphrase = options.encrypt && !options.dryRun ? requireBackupPassphrase() : null;
   const outputRoot = assertBackupOutsideProject(options.output, projectRoot);
   if (options.dryRun) {
-    process.stdout.write(`${JSON.stringify({ mode: "local", dry_run: true, encrypted: options.encrypt, output: outputRoot, database: localDatabaseDumps.map(dump => dump.filename), migrations: "supabase/migrations/*.sql", buckets: backupBuckets })}\n`);
+    process.stdout.write(`${JSON.stringify({ mode: "local", dry_run: true, encrypted: options.encrypt, output: outputRoot, database: localDatabaseDumps.map(dump => dump.filename), migrations: "supabase/migrations/*.sql", buckets: backupBuckets, r2_originals: "included when configured and referenced" })}\n`);
     return;
   }
 
@@ -95,13 +116,28 @@ async function runBackup(argv) {
   let plaintextRemoved = false;
   try {
     const { apiUrl, serviceRoleKey } = getLocalCredentials();
+    const supabase = createClient(apiUrl, serviceRoleKey, { auth: { persistSession: false } });
+    const storageState = await assertBackupStorageComplete(supabase);
+    let r2StorageFiles = [];
+    if (storageState.r2_photos > 0 || hasAnyR2Configuration()) {
+      const r2Photos = await listR2Photos(supabase);
+      if (r2Photos.length !== storageState.r2_photos) throw new Error("A lista de fotos R2 mudou durante a preparação do backup.");
+      const r2Objects = await createR2StorageInventory()();
+      const r2Access = createR2OriginalAccess();
+      r2StorageFiles = await copyR2Originals(
+        r2Photos,
+        r2Objects,
+        join(backupPath, "storage", "r2-originals"),
+        photo => r2Access.readVerifiedOriginal(photo),
+      );
+    }
     const migrationFiles = (await readdir(join(projectRoot, "supabase", "migrations"))).filter(file => file.endsWith(".sql")).sort();
     if (!migrationFiles.length) throw new Error("N\u00e3o foram encontradas migrações para identificar o schema.");
 
     await copyWorkspaceMigrations(join(projectRoot, "supabase", "migrations"), join(backupPath, "migrations"), migrationFiles);
     for (const dump of localDatabaseDumps) await dumpFile(backupPath, dump.filename, dump.args);
 
-    const storage = createClient(apiUrl, serviceRoleKey, { auth: { persistSession: false } }).storage;
+    const storage = supabase.storage;
     const { data: buckets, error: bucketsError } = await storage.listBuckets();
     if (bucketsError) throw new Error(`N\u00e3o foi poss\u00edvel listar os buckets: ${bucketsError.message}`);
     const availableBuckets = new Set((buckets ?? []).map(bucket => bucket.name));
@@ -121,6 +157,9 @@ async function runBackup(argv) {
       migration_files: migrationFiles,
       storage_files: storageCounts,
       storage_object_bytes: Object.fromEntries(Object.entries(storageCounts).map(([bucket, files]) => [bucket, files.reduce((total, file) => total + file.bytes, 0)])),
+      r2_storage_files: r2StorageFiles,
+      r2_storage_objects: r2StorageFiles.length,
+      r2_storage_object_bytes: r2StorageFiles.reduce((total, file) => total + file.bytes, 0),
     });
     await rm(join(backupPath, "INCOMPLETE"));
     const verified = await verifyBackup(backupPath);
@@ -128,7 +167,7 @@ async function runBackup(argv) {
     backupComplete = true;
     const bytes = manifest.files.reduce((total, file) => total + file.size, 0);
     if (!options.encrypt) {
-      process.stdout.write(`${JSON.stringify({ backup: backupPath, files: manifest.files.length, bytes, storage_objects: manifest.storage_objects })}\n`);
+      process.stdout.write(`${JSON.stringify({ backup: backupPath, files: manifest.files.length, bytes, storage_objects: manifest.storage_objects, r2_storage_objects: manifest.r2_storage_objects })}\n`);
       return;
     }
 
@@ -146,7 +185,7 @@ async function runBackup(argv) {
     const archiveBytes = (await stat(encryptedArchivePath)).size;
     await rm(backupPath, { recursive: true, force: false });
     plaintextRemoved = true;
-    process.stdout.write(`${JSON.stringify({ backup: encryptedArchivePath, encrypted: true, files: archiveVerification.files, bytes, archive_bytes: archiveBytes, storage_objects: manifest.storage_objects })}\n`);
+    process.stdout.write(`${JSON.stringify({ backup: encryptedArchivePath, encrypted: true, files: archiveVerification.files, bytes, archive_bytes: archiveBytes, storage_objects: manifest.storage_objects, r2_storage_objects: manifest.r2_storage_objects })}\n`);
   } catch (error) {
     if (!backupComplete) {
       await writeFile(join(backupPath, "INCOMPLETE"), "Backup not yet validated. Do not restore this directory.\n", { mode: 0o600 }).catch(() => {});

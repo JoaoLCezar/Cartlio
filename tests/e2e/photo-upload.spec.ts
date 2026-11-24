@@ -166,6 +166,17 @@ test("uploads private photos, recovers interrupted deletion, and isolates worksp
     await expect(page.getByRole("img", { name: "ensaio.png", exact: true })).toBeVisible({ timeout: 45_000 });
     await expect(page.getByRole("img", { name: "ensaio.jpg", exact: true })).toBeVisible({ timeout: 45_000 });
 
+    const panelOriginalPhoto = await admin.from("photos").select("id, byte_size")
+      .eq("tenant_id", tenantId!).eq("gallery_id", galleryId!).eq("original_filename", "ensaio.png").single();
+    expect(panelOriginalPhoto.error).toBeNull();
+    const panelOriginalUrl = `/painel/${tenantId}/galerias/${galleryId}/fotos/${panelOriginalPhoto.data!.id}/original`;
+    await expect(page.getByRole("link", { name: "Baixar original ensaio.png", exact: true }))
+      .toHaveAttribute("href", panelOriginalUrl);
+    const panelOriginal = await page.request.get(panelOriginalUrl);
+    expect(panelOriginal.status()).toBe(200);
+    expect(panelOriginal.headers()["content-type"]).toContain("image/png");
+    expect((await panelOriginal.body()).length).toBe(panelOriginalPhoto.data!.byte_size);
+
     await checkPublicPortfolio(page, tenantId!, `fotos-${suffix}`);
     await page.goto(`/painel/${tenantId}/galerias/${galleryId}`);
 

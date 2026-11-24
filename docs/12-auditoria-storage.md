@@ -35,13 +35,21 @@ Em uma execução posterior, compare com a mesma abrangência e, se aplicável, 
 npm run storage:audit -- --local --usage --compare $baseline
 ```
 
-A saída inclui a variação em bytes por bucket, total e workspace, além do intervalo entre as medições. Os tamanhos são comparados apenas quando os dois relatórios têm medidas completas; nesse caso, os deltas físicos ficam `null`. A cota contabilizada é comparada separadamente. Snapshots não são enviados ao banco e podem conter IDs de workspaces e, se combinado com `--details`, caminhos de objetos. Guarde-os em local apropriado. Para manter histórico, escolha um nome novo a cada medição.
+A saída inclui a variação em bytes por bucket, total e workspace, além do intervalo entre as medições. Deltas físicos ficam `null` se qualquer um dos relatórios estiver incompleto. Com `--r2`, o snapshot também inclui os bytes do bucket `r2-originals`; quando algum relatório contiver arquivos ou referências R2, os dois precisam incluir o inventário físico para calcular deltas completos. A cota contabilizada é comparada separadamente. Snapshots não são enviados ao banco e podem conter IDs de workspaces e, se combinado com `--details`, caminhos de objetos. Guarde-os em local apropriado. Para manter histórico, escolha um nome novo a cada medição.
 
 Para incluir até 100 caminhos e IDs que precisam de investigação, acrescente `--details`:
 
 ```powershell
 npm run storage:audit -- --local --details
 ```
+
+Quando o bucket R2 de homologação estiver configurado, acrescente `--r2` para paginar o inventário físico dos originais e comparar chaves, tamanho e ETag com fotos; objetos associados a sessões de envio também têm o tamanho comparado com o declarado na sessão:
+
+```powershell
+npm run storage:audit -- --local --r2 --usage --details
+```
+
+Essa opção exige `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` e `R2_BUCKET` no processo local. Ela apenas lista os objetos; não envia, altera nem apaga arquivos. Sem `--r2`, referências R2 tornam a auditoria incompleta. Mantenha o R2 desativado até validar auditoria, backup e restauração com o bucket privado de homologação.
 
 O relatório JSON traz totais de objetos e bytes por bucket, fotos e sessões verificadas, além de originais sem referência, derivados sem foto correspondente, originais ausentes e derivados ausentes em fotos prontas. `--usage` acrescenta bytes físicos estimados por workspace, compara o limite com fotos registradas e reservas ativas, e separa originais de previews/miniaturas. Os tamanhos vêm dos metadados listados pelo Storage; o relatório informa se algum objeto não trouxe tamanho. Por padrão, não inclui caminhos; `--details` inclui até 100 itens e informa se a lista foi truncada. O comando pagina as consultas e percorre subpastas dos buckets. Quando encontra inconsistências, retorna código de saída `1`; sem inconsistências, retorna `0`.
 

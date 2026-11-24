@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isStrongR2Etag, r2OriginalIdentity } from "./r2-storage-client.mjs";
 
 export const legacyBackupBuckets = ["gallery-originals", "gallery-previews", "gallery-thumbnails"];
 export const backupBuckets = [...legacyBackupBuckets, "gallery-brand-assets"];
@@ -8,6 +9,68 @@ export const backupBuckets = [...legacyBackupBuckets, "gallery-brand-assets"];
 export function backupBucketsForManifest(manifest) {
   return manifest?.format_version >= 4 ? backupBuckets : legacyBackupBuckets;
 }
+
+export function assertR2BackupInventory(photos, objects) {
+  if (!Array.isArray(photos) || !(objects instanceof Map)) throw new Error("O inventário R2 não corresponde às referências do banco.");
+  const expected = new Map();
+  try {
+    for (const photo of photos) {
+      const identity = r2OriginalIdentity(photo);
+      if (!isStrongR2Etag(photo.storage_etag) || expected.has(identity.path)) {
+        throw new Error("invalid photo identity");
+      }
+      if (!objects.has(identity.path) && photo.deletion_requested_at != null) continue;
+      expected.set(identity.path, photo);
+    }
+  } catch {
+    throw new Error("O inventário R2 não corresponde às referências do banco.");
+  }
+  if (expected.size !== objects.size) throw new Error("O inventário R2 não corresponde às referências do banco.");
+  for (const [path, photo] of expected) {
+    const object = objects.get(path);
+    if (!object || object.size !== photo.byte_size || object.etag !== photo.storage_etag) {
+      throw new Error("O inventário R2 não corresponde às referências do banco.");
+    }
+  }
+  return [...expected.values()].sort((left, right) => left.object_path.localeCompare(right.object_path));
+}
+
+export async function copyR2Originals(photos, objects, destination, readOriginal) {
+  if (typeof readOriginal !== "function") throw new Error("A leitura verificada dos originais R2 não está disponível.");
+  const orderedPhotos = assertR2BackupInventory(photos, objects);
+  const root = resolve(destination);
+  const files = [];
+  for (const photo of orderedPhotos) {
+    const { path, bytes: expectedBytes, type } = r2OriginalIdentity(photo);
+    const outputFile = resolve(root, ...path.split("/"));
+    const withinBucket = relative(root, outputFile);
+    if (!withinBucket || withinBucket === ".." || withinBucket.startsWith(`..${sep}`) || isAbsolute(withinBucket)) {
+      throw new Error("O inventário R2 contém um caminho fora do diretório de backup.");
+    }
+    const original = await readOriginal(photo);
+    if (!(original instanceof Uint8Array) || original.byteLength !== expectedBytes) {
+      throw new Error("A leitura do original R2 não corresponde à reserva registrada.");
+    }
+    await mkdir(dirname(outputFile), { recursive: true, mode: 0o700 });
+    await writeFile(outputFile, Buffer.from(original), { flag: "wx", mode: 0o600 });
+    files.push({ path, bytes: expectedBytes, content_type: type, etag: photo.storage_etag });
+  }
+  return files;
+}
+
+export async function assertBackupStorageComplete(client) {
+  const [photos, sessions] = await Promise.all([
+    client.from("photos").select("id", { count: "exact", head: true }).eq("storage_provider", "r2"),
+    client.from("upload_sessions").select("id", { count: "exact", head: true })
+      .eq("storage_provider", "r2").in("state", ["reserved", "canceling"]),
+  ]);
+  if (photos.error || sessions.error || !Number.isSafeInteger(photos.count) || !Number.isSafeInteger(sessions.count)) {
+    throw new Error("Não foi possível confirmar a integridade do armazenamento antes do backup.");
+  }
+  if (sessions.count > 0) throw new Error("Aguarde o fim dos envios R2 ativos antes de iniciar o backup.");
+  return { r2_photos: photos.count, r2_active_upload_sessions: sessions.count };
+}
+
 export const localDatabaseDumps = [
   { filename: "roles.sql", args: ["db", "dump", "--local", "--role-only"] },
   { filename: "schema.sql", args: ["db", "dump", "--local"] },
@@ -128,11 +191,15 @@ export async function writeBackupManifest(root, details = {}) {
       sha256: createHash("sha256").update(bytes).digest("hex"),
     });
   }
+  const r2StorageFiles = details.r2_storage_files ?? [];
   const manifest = {
-    format_version: 4,
     created_at: new Date().toISOString(),
     consistency_note: "Pause every process that can write to the database or Storage before starting; the SQL and Storage copies are sequential, not one atomic snapshot.",
     ...details,
+    format_version: 5,
+    r2_storage_files: r2StorageFiles,
+    r2_storage_objects: details.r2_storage_objects ?? r2StorageFiles.length,
+    r2_storage_object_bytes: details.r2_storage_object_bytes ?? r2StorageFiles.reduce((total, file) => total + file.bytes, 0),
     files: entries,
   };
   await writeFile(join(root, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx", mode: 0o600 });
@@ -152,7 +219,7 @@ export async function verifyBackup(rootPath) {
   const manifestInfo = await lstat(manifestPath);
   if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink()) throw new Error("Manifesto de backup inválido.");
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
-  if (![1, 2, 3, 4].includes(manifest.format_version) || !Array.isArray(manifest.files)) throw new Error("Formato de backup não reconhecido.");
+  if (![1, 2, 3, 4, 5].includes(manifest.format_version) || !Array.isArray(manifest.files)) throw new Error("Formato de backup não reconhecido.");
   const expected = new Map();
   for (const file of manifest.files) {
     if (typeof file.path !== "string" || !file.path || isAbsolute(file.path) || file.path.includes("\\") || file.path.split("/").some(segment => !segment || segment === "." || segment === "..")) {
@@ -245,6 +312,30 @@ export async function verifyBackup(rootPath) {
       bucketBytes += file.bytes;
     }
     if (manifest.storage_object_bytes[bucket] !== bucketBytes) throw new Error(`Tamanho total inválido para o bucket ${bucket}.`);
+  }
+  if (manifest.format_version >= 5) {
+    const r2Files = manifest.r2_storage_files;
+    if (!Array.isArray(r2Files) || manifest.r2_storage_objects !== r2Files.length
+      || !Number.isSafeInteger(manifest.r2_storage_object_bytes) || manifest.r2_storage_object_bytes < 0) {
+      throw new Error("Manifesto contém uma lista inválida de originais R2.");
+    }
+    let r2Bytes = 0;
+    for (const file of r2Files) {
+      if (typeof file.path !== "string" || !file.path || isAbsolute(file.path) || file.path.includes("\\")
+        || file.path.split("/").some(segment => !segment || segment === "." || segment === "..")
+        || !Number.isSafeInteger(file.bytes) || file.bytes < 1
+        || !["image/jpeg", "image/png"].includes(file.content_type) || !isStrongR2Etag(file.etag)) {
+        throw new Error("Manifesto contém metadados inválidos para um original R2.");
+      }
+      const path = `storage/r2-originals/${file.path}`;
+      if (expectedStoragePaths.has(path)) throw new Error(`Manifesto contém um original R2 repetido: ${file.path}`);
+      expectedStoragePaths.add(path);
+      const entry = expected.get(path);
+      if (!entry || !paths.has(path) || entry.size !== file.bytes) throw new Error(`Original R2 não corresponde ao arquivo salvo: ${file.path}`);
+      r2Bytes += file.bytes;
+      if (!Number.isSafeInteger(r2Bytes)) throw new Error("Tamanho total dos originais R2 inválido.");
+    }
+    if (manifest.r2_storage_object_bytes !== r2Bytes) throw new Error("Tamanho total dos originais R2 inválido.");
   }
   const actualStoragePaths = new Set([...paths].filter(path => path.startsWith("storage/")));
   if (actualStoragePaths.size !== expectedStoragePaths.size || [...actualStoragePaths].some(path => !expectedStoragePaths.has(path))) {

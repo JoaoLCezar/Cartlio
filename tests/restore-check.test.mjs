@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { auditRestoredPhotoStorage, countRowsInCopyDumps, isolatedSupabaseConfig, parseRestoreCheckArguments, prepareRoleDump, rowCountDifferences } from "../scripts/restore-check-local.mjs";
+import { auditRestoredPhotoStorage, countRowsInCopyDumps, isolatedSupabaseConfig, localizeRestoredR2Photos, parseRestoreCheckArguments, prepareRoleDump, restoreStorage, rowCountDifferences } from "../scripts/restore-check-local.mjs";
 
 test("restore check requires a backup and only accepts explicit dry run", () => {
   assert.throws(() => parseRestoreCheckArguments([]), /--backup/);
@@ -160,4 +161,134 @@ test("restored photo audit matches active originals and ready derivatives withou
   });
   assert.equal(broken.missing_originals, 1);
   assert.equal(broken.missing_derivatives, 1);
+});
+
+test("restored photo audit recognizes R2 originals copied into the temporary Supabase bucket", () => {
+  const photo = {
+    id: "photo-r2",
+    tenant_id: "tenant-r2",
+    gallery_id: "gallery-r2",
+    object_path: "tenant-r2/gallery-r2/photo-r2.png",
+    storage_provider: "supabase",
+    processing_status: "pending",
+    deletion_requested_at: null,
+  };
+  const audit = auditRestoredPhotoStorage([photo], {
+    "gallery-originals": [],
+    "gallery-previews": [],
+    "gallery-thumbnails": [],
+    "gallery-brand-assets": [],
+  }, [], [{ path: photo.object_path, bytes: 4, content_type: "image/png", etag: '"photo-etag"' }]);
+
+  assert.equal(audit.missing_originals, 0);
+});
+
+test("restore check copies archived R2 originals into Supabase and verifies their hashes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "cartlio-restore-r2-storage-"));
+  const objectPath = "10000000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000002/10000000-0000-4000-8000-000000000003.png";
+  const bytes = Buffer.from([1, 2, 3, 4]);
+  const restored = new Map();
+  try {
+    await mkdir(join(directory, "storage", "r2-originals", ...objectPath.split("/").slice(0, 2)), { recursive: true });
+    await writeFile(join(directory, "storage", "r2-originals", ...objectPath.split("/")), bytes);
+    const manifest = {
+      format_version: 5,
+      storage_files: {
+        "gallery-originals": [],
+        "gallery-previews": [],
+        "gallery-thumbnails": [],
+        "gallery-brand-assets": [],
+      },
+      r2_storage_files: [{ path: objectPath, bytes: bytes.length, content_type: "image/png", etag: '"photo-etag"' }],
+      files: [{ path: `storage/r2-originals/${objectPath}`, sha256: createHash("sha256").update(bytes).digest("hex") }],
+    };
+    const client = { storage: { from(bucket) { return {
+      async upload(path, value, options) {
+        assert.equal(bucket, "gallery-originals");
+        restored.set(path, { bytes: Buffer.from(value), options });
+        return { error: null };
+      },
+      async download(path) {
+        const item = restored.get(path);
+        return { data: item ? new Blob([item.bytes]) : null, error: item ? null : new Error("missing") };
+      },
+    }; } } };
+
+    await restoreStorage(client, directory, manifest);
+    assert.deepEqual(restored.get(objectPath).bytes, bytes);
+    assert.equal(restored.get(objectPath).options.contentType, "image/png");
+    assert.equal(restored.get(objectPath).options.upsert, false);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("restore check localizes R2 photo rows only after backup metadata matches", async () => {
+  const photo = {
+    id: "10000000-0000-4000-8000-000000000003",
+    tenant_id: "10000000-0000-4000-8000-000000000001",
+    gallery_id: "10000000-0000-4000-8000-000000000002",
+    object_path: "10000000-0000-4000-8000-000000000001/10000000-0000-4000-8000-000000000002/10000000-0000-4000-8000-000000000003.png",
+    storage_provider: "r2",
+    content_type: "image/png",
+    byte_size: 4,
+    storage_etag: '"photo-etag"',
+  };
+  const r2Files = [{ path: photo.object_path, bytes: 4, content_type: "image/png", etag: photo.storage_etag }];
+  const updated = [];
+  let photoRows = [photo];
+  let activeSessionCount = 0;
+  const client = { from(table) {
+    let mode = "read";
+    return {
+      select(_columns, options) { if (options?.head) mode = "count"; return this; },
+      eq(column, value) { assert.equal(column, "storage_provider"); assert.equal(value, "r2"); return this; },
+      in(column, values) { assert.equal(column, "state"); assert.deepEqual(values, ["reserved", "canceling"]); return this; },
+      order() { return this; },
+      range() { return Promise.resolve({ data: table === "photos" ? photoRows : [], error: null }); },
+      update(values) { mode = "update"; updated.push({ table, values }); return this; },
+      then(resolve, reject) {
+        const result = mode === "count" ? { count: activeSessionCount, error: null }
+          : { data: mode === "update" && table === "photos" ? photoRows : [], error: null };
+        return Promise.resolve(result).then(resolve, reject);
+      },
+    };
+  } };
+
+  assert.equal(await localizeRestoredR2Photos(client, r2Files), 1);
+  assert.deepEqual(updated, [
+    { table: "photos", values: { storage_provider: "supabase", storage_etag: null, storage_delete_absent_at: null } },
+    { table: "upload_sessions", values: {
+      storage_provider: "supabase",
+      r2_put_authorized_at: null,
+      r2_multipart_state: null,
+      r2_multipart_upload_id: null,
+      r2_multipart_started_at: null,
+      r2_multipart_claimed_at: null,
+    } },
+  ]);
+
+  updated.length = 0;
+  await assert.rejects(localizeRestoredR2Photos(client, [{ ...r2Files[0], etag: '"wrong-etag"' }]), /inventário R2/i);
+  assert.deepEqual(updated, []);
+
+  activeSessionCount = 1;
+  await assert.rejects(localizeRestoredR2Photos(client, r2Files), /envios R2 ativos/i);
+  assert.deepEqual(updated, []);
+
+  activeSessionCount = 0;
+  photoRows = [];
+  assert.equal(await localizeRestoredR2Photos(client, []), 0);
+  assert.deepEqual(updated, [{ table: "upload_sessions", values: {
+    storage_provider: "supabase",
+    r2_put_authorized_at: null,
+    r2_multipart_state: null,
+    r2_multipart_upload_id: null,
+    r2_multipart_started_at: null,
+    r2_multipart_claimed_at: null,
+  } }]);
+
+  updated.length = 0;
+  photoRows = [{ ...photo, deletion_requested_at: "2026-11-20T10:00:00.000Z" }];
+  assert.equal(await localizeRestoredR2Photos(client, []), 1);
+  assert.equal(updated[0].table, "photos");
+  assert.equal(updated[0].values.storage_delete_absent_at, null);
 });

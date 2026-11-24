@@ -42,7 +42,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ toke
     } });
   }
 
-  const url = await createMediaReader(supabase).signOriginal(file.path, 60, file.filename);
+  const url = await createMediaReader(supabase).signSupabaseOriginal(file.path, 60, file.filename);
   if (!url) return new Response(null, { status: 404, headers: noStore });
   return new Response(null, { status: 302, headers: { ...noStore, Location: url } });
 }

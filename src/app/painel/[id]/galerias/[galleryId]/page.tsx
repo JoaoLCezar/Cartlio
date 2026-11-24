@@ -7,6 +7,7 @@ import { GallerySharing } from "@/components/gallery-sharing";
 import { duplicateGallery } from "@/app/painel/[id]/actions";
 import type { StorageUsage, UploadSession } from "@/lib/upload-lifecycle";
 import { createMediaReader } from "@/lib/media-storage";
+import { panelOriginalUrl } from "@/lib/media-storage-policy";
 
 const initialPhotoGridPageSize = 60;
 
@@ -25,7 +26,7 @@ export default async function EditGalleryPage({ params }: { params: Promise<{ id
   if (!isUuid(galleryId)) notFound();
   const [gallery, photos, uploads, usage, shares] = await Promise.all([
     supabase.from("galleries").select("id, title, slug, description, customer_id, status, cover_photo_id").eq("tenant_id", id).eq("id", galleryId).maybeSingle(),
-    supabase.from("photos").select("id, object_path, original_filename, byte_size, deletion_requested_at, processing_status, sort_order, created_at", { count: "exact" })
+    supabase.from("photos").select("id, object_path, storage_provider, original_filename, byte_size, deletion_requested_at, processing_status, sort_order, created_at", { count: "exact" })
       .eq("tenant_id", id).eq("gallery_id", galleryId).is("deletion_requested_at", null)
       .order("sort_order", { ascending: true }).order("created_at", { ascending: false }).order("id", { ascending: true })
       .range(0, initialPhotoGridPageSize - 1),
@@ -34,7 +35,7 @@ export default async function EditGalleryPage({ params }: { params: Promise<{ id
     supabase.from("gallery_shares").select("id, created_at, last_rotated_at, expires_at, revoked_at, submitted_at, submitted_name, selection_reviewed_at, downloads_enabled, selection_limit, share_mode, pin_enabled, revision_requested_at, revision_message").eq("tenant_id", id).eq("gallery_id", galleryId).order("created_at", { ascending: false }),
   ]);
   const [pendingDeletions, readyPhotoCount, processingPhotoCount, firstReadyPhoto] = await Promise.all([
-    supabase.from("photos").select("id, object_path, original_filename, byte_size, deletion_requested_at, processing_status")
+    supabase.from("photos").select("id, object_path, storage_provider, original_filename, byte_size, deletion_requested_at, processing_status")
       .eq("tenant_id", id).eq("gallery_id", galleryId).not("deletion_requested_at", "is", null)
       .order("deletion_requested_at", { ascending: false }).order("id", { ascending: true }),
     supabase.from("photos").select("id", { count: "exact", head: true })
@@ -101,10 +102,9 @@ export default async function EditGalleryPage({ params }: { params: Promise<{ id
   const initialReadyPhotos = photos.data.filter(photo => photo.processing_status === "ready");
   const derivedPaths = initialReadyPhotos.map(photo => `${id}/${galleryId}/${photo.id}.webp`);
   const media = createMediaReader(supabase);
-  const [thumbnailUrls, previewUrls, originalUrls] = await Promise.all([
+  const [thumbnailUrls, previewUrls] = await Promise.all([
     media.signPaths("thumbnail", derivedPaths, 900),
     media.signPaths("preview", derivedPaths, 900),
-    media.signPaths("original", initialReadyPhotos.map(photo => photo.object_path), 900),
   ]);
   const signedPhotos = photos.data.map(photo => {
     if (photo.deletion_requested_at || photo.processing_status !== "ready") {
@@ -115,7 +115,7 @@ export default async function EditGalleryPage({ params }: { params: Promise<{ id
       ...photo,
       thumbnailUrl: thumbnailUrls.get(derivedPath) ?? null,
       previewUrl: previewUrls.get(derivedPath) ?? null,
-      originalUrl: originalUrls.get(photo.object_path) ?? null,
+      originalUrl: panelOriginalUrl(id, galleryId, photo.id),
     };
   });
   const galleryCustomerId = gallery.data.customer_id;
