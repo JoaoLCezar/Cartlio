@@ -37,12 +37,26 @@ export function createPhotoUploadFlow(supabase: ReturnType<typeof createClient>)
         if (!await hasPhotoSignature(file)) {
           throw new Error(`O conteúdo de “${file.name}” não corresponde a uma imagem JPEG ou PNG.`);
         }
-        const reserved = await supabase.rpc("reserve_photo_upload", {
-          ...scope(crypto.randomUUID()), p_filename: normalizedPhotoFilename(file.name),
-          p_content_type: file.type, p_byte_size: file.size,
+        const response = await fetch("/api/photo-uploads/reservations", {
+          method: "POST",
+          credentials: "same-origin",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tenantId,
+            galleryId,
+            uploadId: crypto.randomUUID(),
+            filename: normalizedPhotoFilename(file.name),
+            contentType: file.type,
+            byteSize: file.size,
+          }),
         });
-        if (reserved.error || !reserved.data) throw new Error(uploadError(reserved.error?.message ?? ""));
-        const session = reserved.data as UploadSession;
+        const reserved = await response.json().catch(() => null) as UploadSession | { error?: string } | null;
+        if (!response.ok || !reserved || !("id" in reserved)) {
+          const code = reserved && "error" in reserved ? reserved.error : "";
+          throw new Error(uploadError(code ?? ""));
+        }
+        const session = reserved as UploadSession;
         requireSupportedProvider(session);
         if (!matchesReservation(session, file)) throw new Error("O arquivo não corresponde à reserva deste envio.");
         await transport.send(session, file, onProgress);

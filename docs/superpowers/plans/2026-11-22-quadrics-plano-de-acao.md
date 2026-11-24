@@ -62,11 +62,18 @@
 
 **Verificação local em 23/11/2026 — revisão do inventário.** A suíte passou com 188 testes; ESLint, geração de tipos do Next, TypeScript, `backup-local --dry-run` e `git diff --check` também passaram. A auditoria agora detecta objetos de envio R2 cujo tamanho diverge do declarado pela sessão; o teste desse caso foi observado falhar antes da correção e passar depois. O ensaio com bucket R2 privado continua pendente, e a auditoria contra o Supabase local depende de o Docker estar acessível neste ambiente.
 
+**Desenvolvimento local em 24/11/2026 — reserva R2.** Foi preparado um seletor server-side que mantém Supabase como padrão e exige as credenciais privadas completas antes de aceitar R2. A migration adiciona uma reserva R2 somente para `service_role`, vinculada ao membro, galeria, chave derivada e cota do workspace. Ainda falta conectar essa reserva às rotas e ao fluxo de envio; o R2 permanece desativado. A suíte unitária passou com 193 testes, junto com ESLint, geração de tipos, TypeScript e `git diff --check`. As verificações SQL não foram executadas nesta etapa.
+
+**Desenvolvimento local em 24/11/2026 — endpoint de reserva.** O cliente agora pede a reserva Supabase a uma rota do servidor. Ela confere origem, sessão, campos e tamanho do pedido antes de gravar; o seletor R2 é recusado antes de criar sessão enquanto envio, retomada, cancelamento e reconciliação não estiverem conectados. A suíte passou com 197 testes, a geração de tipos e o TypeScript passaram; o ESLint não encontrou erros e manteve um aviso preexistente em `tests/restore-check.test.mjs`. A migration R2 continua sem aplicação e sem teste SQL.
+
 ## Entrega 3 — Integrar e validar o R2
 
 **Depende da Entrega 2.** Configurar primeiro um bucket privado de homologação. Os segredos ficam no servidor.
 
 - [ ] Criar o transporte R2 e habilitar somente por configuração. Emitir autorizações temporárias restritas à operação e à chave reservada. Usar upload direto e, para arquivos grandes, guardar o identificador do envio por partes e permitir retomar após queda de conexão.
+  - [x] Preparar o seletor server-side, com Supabase como padrão, e a reserva R2 exclusiva de serviço, que valida membro, workspace, galeria, metadados, chave e cota.
+  - [x] Conectar a reserva Supabase ao cliente por uma rota autenticada e protegida contra chamadas de outra origem.
+  - [ ] Integrar reservas R2, operações assinadas e transporte à rota e ao cliente; concluir retomada, cancelamento e reconciliação antes de permitir seleção R2.
 - [ ] Com os dois provedores, validar envio pequeno, retomada, confirmação repetida, arquivo divergente, expiração e descarte. Exercitar processamento, miniaturas, download, ZIP com objetos dos dois provedores, exclusão e restauração.
 - [ ] Antes de decidir sobre arquivos existentes, inventariar o volume e a origem. Se forem copiados, preservar as chaves, verificar quantidade, integridade e leitura no destino e só então atualizar as referências. Manter as cópias de origem durante o período de observação.
 - [ ] Ensaiar a volta do padrão de novos envios ao Supabase. Sessões em andamento e arquivos já gravados no R2 devem continuar acessíveis pelo provedor registrado.
