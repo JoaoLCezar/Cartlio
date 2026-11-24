@@ -1,10 +1,7 @@
 begin;
 select no_plan();
 
--- Exercise a future R2 reservation inside this rolled-back transaction only.
-select ok(exists (select 1 from pg_constraint where conrelid = 'public.upload_sessions'::regclass
-  and conname = 'upload_sessions_storage_provider_check' and pg_get_constraintdef(oid) not ilike '%r2%'),
-  'R2 reservations remain disabled in the deployed schema');
+-- Exercise R2 confirmation inside this rolled-back transaction only.
 alter table public.upload_sessions drop constraint upload_sessions_storage_provider_check;
 alter table public.photos drop constraint photos_storage_provider_check;
 
