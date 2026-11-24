@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { isUuid } from "@/lib/gallery-validation";
 import { createMediaReader } from "@/lib/media-storage";
+import { readLimitedJson } from "@/lib/request-json";
 import { requireWorkspace } from "@/lib/workspace";
 
 export const dynamic = "force-dynamic";
@@ -10,6 +11,7 @@ const photoPageSize = 60;
 const photoIdPageSize = 1000;
 const maxPhotoOffset = 1_000_000;
 const maxSelectedPhotoIds = 200;
+const maxRequestBodyBytes = 16 * 1024;
 
 function responseError(message: string, status: number) {
   return NextResponse.json({ error: message }, { status, headers: responseHeaders });
@@ -86,8 +88,10 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const authorized = await authorizeGallery(tenantId, galleryId);
   if ("response" in authorized) return authorized.response;
 
-  let body: unknown;
-  try { body = await request.json(); } catch { return responseError("Solicitação inválida.", 400); }
+  const parsed = await readLimitedJson(request, maxRequestBodyBytes);
+  if (!parsed.ok) return responseError(parsed.reason === "too-large" ? "Solicitação muito grande." : "Solicitação inválida.",
+    parsed.reason === "too-large" ? 413 : 400);
+  const body = parsed.value;
   if (!body || typeof body !== "object" || !Array.isArray((body as { ids?: unknown }).ids)) {
     return responseError("Solicitação inválida.", 400);
   }

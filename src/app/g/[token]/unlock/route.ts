@@ -2,14 +2,19 @@ import { NextResponse } from "next/server";
 import { galleryPinCookieName } from "@/lib/gallery-pin";
 import { galleryPinClientFingerprint } from "@/lib/gallery-pin-client";
 import { sharePinClient } from "@/lib/supabase/share";
+import { readLimitedJson } from "@/lib/request-json";
 
 export const dynamic = "force-dynamic";
+const maxRequestBodyBytes = 16 * 1024;
 
 export async function POST(request: Request, { params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   if (!/^[0-9a-f]{64}$/.test(token)) return NextResponse.json({ error: "Link inválido." }, { status: 404 });
-  let body: unknown;
-  try { body = await request.json(); } catch { return NextResponse.json({ error: "Informe o PIN." }, { status: 400 }); }
+  const parsed = await readLimitedJson(request, maxRequestBodyBytes);
+  if (!parsed.ok) return NextResponse.json({ error: parsed.reason === "too-large" ? "Solicitação muito grande." : "Informe o PIN." }, {
+    status: parsed.reason === "too-large" ? 413 : 400,
+  });
+  const body = parsed.value;
   const pin = typeof body === "object" && body !== null && "pin" in body ? body.pin : null;
   if (typeof pin !== "string" || !/^[0-9]{6,12}$/.test(pin)) {
     return NextResponse.json({ error: "O PIN deve ter de 6 a 12 números." }, { status: 400 });

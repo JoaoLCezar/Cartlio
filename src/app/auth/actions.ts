@@ -7,6 +7,7 @@ import { supabaseConfig } from "@/lib/supabase/config";
 import type { FormState } from "@/components/action-form";
 import { authReturnPath, safeInvitationReturnPath } from "@/lib/auth-redirect";
 import { trustedAppOrigin } from "@/lib/app-origin";
+import { passwordResetFeedback } from "@/lib/password-reset-feedback";
 
 async function authenticate(data: FormData, signup: boolean): Promise<FormState> {
   if (!supabaseConfig()) return { error: "O acesso ainda não foi configurado. Tente novamente mais tarde." };
@@ -53,8 +54,12 @@ export async function requestPasswordReset(_state: FormState, data: FormData): P
     return { error: "Não foi possível iniciar a recuperação. Atualize a página e tente novamente." };
   }
   const callbackUrl = new URL("/auth/callback?next=/redefinir-senha", origin).toString();
-  await (await createClient()).auth.resetPasswordForEmail(email, { redirectTo: callbackUrl });
-  return { success: "Se houver uma conta para esse e-mail, enviaremos um link para redefinir a senha." };
+  try {
+    const { error } = await (await createClient()).auth.resetPasswordForEmail(email, { redirectTo: callbackUrl });
+    return passwordResetFeedback(!!error);
+  } catch {
+    return passwordResetFeedback(true);
+  }
 }
 
 export async function updatePassword(_state: FormState, data: FormData): Promise<FormState> {

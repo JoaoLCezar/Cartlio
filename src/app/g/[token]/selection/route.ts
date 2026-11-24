@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import { galleryPinSession } from "@/lib/gallery-pin";
+import { readLimitedJson } from "@/lib/request-json";
 import { shareLookupClient } from "@/lib/supabase/share";
 
 export const dynamic = "force-dynamic";
+const maxRequestBodyBytes = 16 * 1024;
 
 function selectionRateLimitResponse(error: { code: string; message: string; details: string | null }) {
   if (error.code !== "PT429" && !error.message.includes("SELECTION_RATE_LIMITED")) return null;
@@ -16,8 +18,11 @@ function selectionRateLimitResponse(error: { code: string; message: string; deta
 export async function POST(request: Request, { params }: { params: Promise<{ token: string }> }) {
   const { token } = await params;
   if (!/^[0-9a-f]{64}$/.test(token)) return NextResponse.json({ error: "Link inválido." }, { status: 404 });
-  let body: unknown;
-  try { body = await request.json(); } catch { return NextResponse.json({ error: "Solicitação inválida." }, { status: 400 }); }
+  const parsed = await readLimitedJson(request, maxRequestBodyBytes);
+  if (!parsed.ok) return NextResponse.json({ error: parsed.reason === "too-large" ? "Solicitação muito grande." : "Solicitação inválida." }, {
+    status: parsed.reason === "too-large" ? 413 : 400,
+  });
+  const body = parsed.value;
   if (!body || typeof body !== "object") return NextResponse.json({ error: "Solicitação inválida." }, { status: 400 });
   const input = body as Record<string, unknown>;
   const accessToken = await galleryPinSession(token);
