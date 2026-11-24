@@ -1,0 +1,10 @@
+[Unit]
+Description=Quadrics maintenance, image processing and notifications
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/quadrics
+ExecStart=/usr/bin/docker compose --env-file .env.production.local -f compose.production.yaml run --rm --no-deps maintenance

@@ -1,0 +1,40 @@
+services:
+  web:
+    build:
+      context: .
+      target: runner
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:?Configure a URL pública do Supabase}
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:?Configure a chave pública do Supabase}
+        NEXT_PUBLIC_SUPABASE_STORAGE_URL: ${NEXT_PUBLIC_SUPABASE_STORAGE_URL:-}
+    env_file: .env.production.local
+    environment:
+      QUADRICS_TRUSTED_CLIENT_IP_HEADER: x-real-ip
+    restart: unless-stopped
+    init: true
+  proxy:
+    image: caddy:2-alpine
+    environment:
+      QUADRICS_HOST: ${QUADRICS_HOST:?Configure o hostname público}
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+  maintenance:
+    profiles: [maintenance]
+    build:
+      context: .
+      target: maintenance
+    env_file: .env.production.local
+    init: true
+
+volumes:
+  caddy_data:
+  caddy_config:
